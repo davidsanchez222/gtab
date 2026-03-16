@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Workspace directory: override with GWS_DIR environment variable
-BASE_DIR="${GWS_DIR:-$HOME/.config/gws}"
+# Workspace directory: override with GTAB_DIR environment variable
+BASE_DIR="${GTAB_DIR:-$HOME/.config/gtab}"
 
 mkdir -p "$BASE_DIR"
 
 usage() {
-  echo "gws — Ghostty Workspace Manager"
+  echo "gtab — Ghostty Tab Workspace Manager"
   echo ""
   echo "Usage:"
-  echo "  gws <name>          Launch a workspace"
-  echo "  gws save <name>     Save current Ghostty window as a workspace"
-  echo "  gws list            List all saved workspaces"
-  echo "  gws edit <name>     Edit a workspace script"
-  echo "  gws remove <name>   Remove a workspace"
+  echo "  gtab <name>          Launch a workspace"
+  echo "  gtab save <name>     Save current Ghostty window as a workspace"
+  echo "  gtab list            List all saved workspaces"
+  echo "  gtab edit <name>     Edit a workspace script"
+  echo "  gtab remove <name>   Remove a workspace"
   echo ""
   echo "Workspace scripts are stored in: $BASE_DIR"
-  echo "Override with: export GWS_DIR=/your/path"
+  echo "Override with: export GTAB_DIR=/your/path"
 }
 
 cmd="${1:-}"
@@ -35,7 +35,7 @@ case "$cmd" in
     [ -n "$name" ] || { echo "Error: missing workspace name"; exit 1; }
     file="$BASE_DIR/$name.applescript"
 
-    tmp=$(mktemp /tmp/gws_XXXXXX)
+    tmp=$(mktemp /tmp/gtab_XXXXXX)
     cat > "$tmp" <<'ASCRIPT'
 set rows to {}
 tell application "Ghostty"
@@ -106,7 +106,7 @@ ASCRIPT
 
   *)
     file="$BASE_DIR/$cmd.applescript"
-    [ -f "$file" ] || { echo "Error: workspace '$cmd' not found. Run 'gws list' to see available workspaces."; exit 1; }
+    [ -f "$file" ] || { echo "Error: workspace '$cmd' not found. Run 'gtab list' to see available workspaces."; exit 1; }
     osascript "$file"
     ;;
 esac
