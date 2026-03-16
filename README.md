@@ -18,8 +18,7 @@ A lightweight CLI tool to save and restore [Ghostty](https://ghostty.org) termin
 ### Homebrew (recommended)
 
 ```bash
-brew tap Franvy/gws
-brew install gws
+brew install Franvy/gws/gws
 ```
 
 ### Manual
@@ -114,8 +113,7 @@ Each workspace is stored as a plain AppleScript file (`.applescript`) that you c
 ### Homebrew（推荐）
 
 ```bash
-brew tap Franvy/gws
-brew install gws
+brew install Franvy/gws/gws
 ```
 
 ### 手动安装
