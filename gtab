@@ -31,6 +31,7 @@ usage() {
   printf '   %sgtab list%s             List all saved workspaces\n' "$BOLD" "$RESET"
   printf '   %sgtab edit%s <%s%sname%s>      Edit a workspace script\n' "$BOLD" "$RESET" "$ITALIC" "$YELLOW" "$RESET"
   printf '   %sgtab remove%s <%s%sname%s>    Remove a workspace\n' "$BOLD" "$RESET" "$ITALIC" "$YELLOW" "$RESET"
+  printf '   %sgtab --version%s           Show version\n' "$BOLD" "$RESET"
   echo
   printf ' %sWorkspaces:%s %s%s%s\n' "$DIM" "$RESET" "$DIM" "$BASE_DIR" "$RESET"
   printf ' %sOverride:%s   %sexport GTAB_DIR=/your/path%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
@@ -120,6 +121,10 @@ ASCRIPT
     [ -f "$file" ] || { err "workspace '$name' not found"; exit 1; }
     rm -f "$file"
     ok "Removed workspace ${YELLOW}\"$name\"${RESET}"
+    ;;
+
+  --version|-v)
+    printf '%s\n' "gtab 1.2.1"
     ;;
 
   ""|--help|-h)
