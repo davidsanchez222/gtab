@@ -18,7 +18,8 @@ A lightweight CLI tool to save and restore [Ghostty](https://ghostty.org) termin
 ### Homebrew (recommended)
 
 ```bash
-brew install Franvy/gtab/gtab
+brew tap Franvy/gtab
+brew install gtab
 ```
 
 ### Manual
@@ -113,7 +114,8 @@ Each workspace is stored as a plain AppleScript file (`.applescript`) that you c
 ### Homebrew（推荐）
 
 ```bash
-brew install Franvy/gtab/gtab
+brew tap Franvy/gtab
+brew install gtab
 ```
 
 ### 手动安装
