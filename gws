@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Workspace directory: override with GWS_DIR environment variable
+BASE_DIR="${GWS_DIR:-$HOME/.config/gws}"
+
+mkdir -p "$BASE_DIR"
+
+usage() {
+  echo "gws — Ghostty Workspace Manager"
+  echo ""
+  echo "Usage:"
+  echo "  gws <name>          Launch a workspace"
+  echo "  gws save <name>     Save current Ghostty window as a workspace"
+  echo "  gws list            List all saved workspaces"
+  echo "  gws edit <name>     Edit a workspace script"
+  echo "  gws remove <name>   Remove a workspace"
+  echo ""
+  echo "Workspace scripts are stored in: $BASE_DIR"
+  echo "Override with: export GWS_DIR=/your/path"
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+  list)
+    ls "$BASE_DIR"/*.applescript 2>/dev/null \
+      | xargs -n1 basename \
+      | sed 's/\.applescript$//' \
+      || echo "(no workspaces saved)"
+    ;;
+
+  save)
+    name="${2:-}"
+    [ -n "$name" ] || { echo "Error: missing workspace name"; exit 1; }
+    file="$BASE_DIR/$name.applescript"
+
+    tmp=$(mktemp /tmp/gws_XXXXXX)
+    cat > "$tmp" <<'ASCRIPT'
+set rows to {}
+tell application "Ghostty"
+  set win to front window
+  set n to count of tabs of win
+  repeat with i from 1 to n
+    set t to tab i of win
+    set surf to focused terminal of t
+    try
+      set wd to working directory of surf
+    on error
+      set wd to ""
+    end try
+    set ttl to name of t
+    if ttl starts with "⠐ " then set ttl to text 3 thru -1 of ttl
+    set end of rows to (wd & "	" & ttl)
+  end repeat
+end tell
+set AppleScript's text item delimiters to linefeed
+return rows as text
+ASCRIPT
+    raw=$(osascript "$tmp" 2>/dev/null)
+    rm -f "$tmp"
+
+    [ -n "$raw" ] || { echo "Error: could not read Ghostty tabs (make sure Ghostty is the frontmost app)"; exit 1; }
+
+    out='tell application "Ghostty"\n    activate'
+    i=0
+    while IFS=$'\t' read -r wd title; do
+      i=$((i+1))
+      [ -z "$wd" ] && wd="$HOME"
+      out+="\n\n    set cfg$i to new surface configuration"
+      out+="\n    set initial working directory of cfg$i to \"$wd\""
+      if [ "$i" -eq 1 ]; then
+        out+="\n    set win to new window with configuration cfg$i"
+        out+="\n    set term$i to focused terminal of selected tab of win"
+      else
+        out+="\n    set tab$i to new tab in win with configuration cfg$i"
+        out+="\n    set term$i to focused terminal of tab$i"
+      fi
+      [ -n "$title" ] && out+="\n    perform action \"set_tab_title:$title\" on term$i"
+    done <<< "$raw"
+    out+="\nend tell"
+
+    printf '%b\n' "$out" > "$file"
+    echo "Saved: $file"
+    ;;
+
+  edit)
+    name="${2:-}"
+    [ -n "$name" ] || { echo "Error: missing workspace name"; exit 1; }
+    "${EDITOR:-vim}" "$BASE_DIR/$name.applescript"
+    ;;
+
+  remove)
+    name="${2:-}"
+    [ -n "$name" ] || { echo "Error: missing workspace name"; exit 1; }
+    file="$BASE_DIR/$name.applescript"
+    [ -f "$file" ] || { echo "Error: workspace '$name' not found"; exit 1; }
+    rm -f "$file"
+    echo "Removed: $name"
+    ;;
+
+  ""|--help|-h)
+    usage
+    [ -z "$cmd" ] && exit 1 || exit 0
+    ;;
+
+  *)
+    file="$BASE_DIR/$cmd.applescript"
+    [ -f "$file" ] || { echo "Error: workspace '$cmd' not found. Run 'gws list' to see available workspaces."; exit 1; }
+    osascript "$file"
+    ;;
+esac
