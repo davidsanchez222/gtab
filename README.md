@@ -4,6 +4,8 @@
 
 A lightweight CLI tool to save and restore [Ghostty](https://ghostty.org) terminal window layouts — capture your current tabs (with working directories and custom titles) into a named workspace, then reopen them anytime with a single command.
 
+![gtab demo](Gtab.gif)
+
 ---
 
 ## Requirements
@@ -91,3 +93,9 @@ Each workspace is stored as a plain AppleScript file (`.applescript`) that you c
 ## How it works
 
 `gtab save` uses Ghostty's AppleScript API to read each tab's working directory and title, then generates an AppleScript that recreates the exact layout when run.
+
+---
+
+## License
+
+MIT

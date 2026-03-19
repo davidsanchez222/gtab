@@ -4,6 +4,8 @@
 
 一个轻量的命令行工具，用于保存和恢复 [Ghostty](https://ghostty.org) 终端窗口布局 —— 将当前标签页（包含工作目录和自定义标题）保存为一个命名的 workspace，之后一条命令即可还原。
 
+![gtab demo](Gtab.gif)
+
 ---
 
 ## 环境要求
@@ -91,3 +93,9 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 ## 工作原理
 
 `gtab save` 通过 Ghostty 的 AppleScript API 读取每个标签的工作目录和标题，生成一个能完整还原布局的 AppleScript 脚本。
+
+---
+
+## License
+
+MIT
