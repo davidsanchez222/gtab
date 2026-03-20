@@ -4,6 +4,8 @@
 
 A lightweight CLI tool to save and restore [Ghostty](https://ghostty.org) terminal window layouts — capture your current tabs (with working directories and custom titles) into a named workspace, then reopen them anytime with a single command.
 
+"If you live in tmux, you don't need this. If you prefer Ghostty's native tabs and macOS look, this is for you."
+
 ![gtab demo](Gtab.gif)
 
 ---
