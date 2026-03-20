@@ -4,6 +4,8 @@
 
 A Rust-powered Ghostty workspace manager with a keyboard-first TUI and compatible CLI commands. Save the current terminal layout as a workspace, search saved workspaces, inspect their saved tabs in a dialog-style TUI, then relaunch them with one key or one command.
 
+"If you live in tmux, you don't need this. If you prefer Ghostty's native tabs and macOS look, this is for you."
+
 ![gtab demo](Gtab.gif)
 
 ---
