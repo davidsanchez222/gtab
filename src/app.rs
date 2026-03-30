@@ -23,6 +23,7 @@ use std::{
 };
 
 const SPLASH_MS: u64 = 850;
+const DOUBLE_CLICK_MS: u64 = 350;
 
 pub fn run_tui(env: &mut AppEnv) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
@@ -239,11 +240,18 @@ struct StatusLine {
 }
 
 #[derive(Clone, Debug)]
+struct ClickState {
+    index: usize,
+    at: Instant,
+}
+
+#[derive(Clone, Debug)]
 struct App {
     workspaces: Vec<Workspace>,
     selected: usize,
     list_offset: usize,
     list_area: Rect,
+    last_click: Option<ClickState>,
     filter: String,
     show_preview: bool,
     dialog: Dialog,
@@ -262,6 +270,7 @@ impl App {
             selected: 0,
             list_offset: 0,
             list_area: Rect::default(),
+            last_click: None,
             filter: String::new(),
             show_preview: true,
             dialog: Dialog::None,
@@ -271,7 +280,7 @@ impl App {
             splash_visible: true,
             status: Some(StatusLine {
                 kind: StatusKind::Info,
-                text: "Click or Enter to launch, w/s to move, a to save, t for settings."
+                text: "Click selects, double-click or Enter launches, w/s moves, a saves."
                     .to_string(),
             }),
             status_expiry: None,
@@ -280,6 +289,7 @@ impl App {
 
     fn reload(&mut self, workspaces: Vec<Workspace>) {
         self.workspaces = workspaces;
+        self.clear_pending_click();
         self.clamp_selection();
     }
 
@@ -337,10 +347,12 @@ impl App {
             .position(|workspace| workspace.name == name)
         else {
             self.selected = 0;
+            self.clear_pending_click();
             return;
         };
 
         self.selected = position;
+        self.clear_pending_click();
     }
 
     fn clamp_selection(&mut self) {
@@ -356,12 +368,26 @@ impl App {
         let len = self.visible_indices().len();
         if len == 0 {
             self.selected = 0;
+            self.clear_pending_click();
             return;
         }
 
         let max = len.saturating_sub(1) as isize;
         let next = (self.selected as isize + delta).clamp(0, max);
         self.selected = next as usize;
+        self.clear_pending_click();
+    }
+
+    fn clear_pending_click(&mut self) {
+        self.last_click = None;
+    }
+
+    fn is_double_click(&self, index: usize, clicked_at: Instant) -> bool {
+        self.last_click.as_ref().is_some_and(|last_click| {
+            last_click.index == index
+                && clicked_at.duration_since(last_click.at)
+                    <= Duration::from_millis(DOUBLE_CLICK_MS)
+        })
     }
 
     fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
@@ -497,6 +523,7 @@ impl App {
             if !key.modifiers.contains(KeyModifiers::CONTROL) && self.should_extend_filter(c) {
                 self.filter.push(c);
                 self.selected = 0;
+                self.clear_pending_click();
                 self.clamp_selection();
                 return Ok(Action::None);
             }
@@ -508,6 +535,7 @@ impl App {
                 if !self.filter.is_empty() {
                     self.filter.clear();
                     self.selected = 0;
+                    self.clear_pending_click();
                     return Ok(Action::None);
                 }
 
@@ -523,6 +551,7 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.selected = 0;
+                self.clear_pending_click();
                 Ok(Action::None)
             }
             KeyCode::Char('G') => {
@@ -530,6 +559,7 @@ impl App {
                 if len > 0 {
                     self.selected = len - 1;
                 }
+                self.clear_pending_click();
                 Ok(Action::None)
             }
             KeyCode::Enter => {
@@ -570,6 +600,7 @@ impl App {
             KeyCode::Backspace => {
                 self.filter.pop();
                 self.selected = 0;
+                self.clear_pending_click();
                 self.clamp_selection();
                 Ok(Action::None)
             }
@@ -586,15 +617,34 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(index) = self.list_index_at(mouse.column, mouse.row) else {
+                    self.clear_pending_click();
                     return Ok(Action::None);
                 };
 
                 self.selected = index;
+                let clicked_at = Instant::now();
+                if self.is_double_click(index, clicked_at) {
+                    self.clear_pending_click();
+                    let Some(workspace) = self.selected_workspace() else {
+                        return Ok(Action::None);
+                    };
+
+                    return Ok(Action::Launch(workspace.name.clone()));
+                }
+
+                self.last_click = Some(ClickState {
+                    index,
+                    at: clicked_at,
+                });
                 let Some(workspace) = self.selected_workspace() else {
                     return Ok(Action::None);
                 };
 
-                Ok(Action::Launch(workspace.name.clone()))
+                self.set_info(format!(
+                    "Selected \"{}\". Double-click or press Enter to launch.",
+                    workspace.name
+                ));
+                Ok(Action::None)
             }
             MouseEventKind::ScrollDown if self.list_contains(mouse.column, mouse.row) => {
                 self.move_selection(1);
@@ -638,7 +688,7 @@ impl App {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
     Quit,
@@ -860,6 +910,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let keys = Line::from(vec![
         Span::styled("click", Style::default().fg(Color::Cyan)),
+        Span::raw(" select  "),
+        Span::styled("dbl-click", Style::default().fg(Color::Cyan)),
         Span::raw(" launch  "),
         Span::styled("Enter", Style::default().fg(Color::Cyan)),
         Span::raw(" launch  "),
@@ -1038,4 +1090,41 @@ fn shortcut_sync_message(sync: &GhosttyShortcutSync) -> String {
         sync.shortcut,
         sync.include_path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn workspace(name: &str) -> Workspace {
+        Workspace {
+            name: name.to_string(),
+            tabs: vec!["tab".to_string()],
+        }
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn single_click_selects_and_double_click_launches() {
+        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        app.dismiss_splash();
+        app.list_area = Rect::new(0, 0, 40, 6);
+
+        assert_eq!(app.handle_mouse(left_click(1, 1)).unwrap(), Action::None);
+        assert_eq!(app.selected, 1);
+
+        assert_eq!(
+            app.handle_mouse(left_click(1, 1)).unwrap(),
+            Action::Launch("beta".to_string())
+        );
+    }
 }

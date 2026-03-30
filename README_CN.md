@@ -60,6 +60,7 @@ gtab set ghostty_shortcut cmd+g
 
 ```text
 Enter   启动当前选中的 workspace
+mouse   单击选中，双击启动
 w/s     在 workspace 列表中上下移动
 a       保存当前 Ghostty 窗口
 e       用 $EDITOR 编辑当前 workspace

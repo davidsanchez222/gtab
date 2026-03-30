@@ -60,6 +60,7 @@ gtab set ghostty_shortcut cmd+g
 
 ```text
 Enter   launch selected workspace
+mouse   click to select, double-click to launch
 w/s     move through the workspace list
 a       save the current Ghostty window
 e       edit the selected workspace in $EDITOR
