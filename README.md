@@ -45,9 +45,11 @@ gtab save <name>     Save current Ghostty window as a workspace
 gtab list            List all saved workspaces
 gtab edit <name>     Edit a workspace script
 gtab remove <name>   Remove a workspace
-gtab shortcut        Show the recommended launcher for macOS shortcut tools
+gtab hotkey status   Show the built-in global hotkey helper status
+gtab hotkey doctor   Show diagnostics for the hotkey helper
 gtab set             Show settings
 gtab set close_tab on|off
+gtab set global_shortcut cmd+g
 gtab set ghostty_shortcut off|cmd+shift+g
 ```
 
@@ -56,7 +58,8 @@ gtab set ghostty_shortcut off|cmd+shift+g
 1. Open Ghostty and set up your tabs.
 2. Run `gtab save myproject` to capture the layout.
 3. Run `gtab` to open the TUI and search, preview, or launch saved workspaces.
-4. Run `gtab shortcut` and bind the generated launcher in Shortcuts, Raycast, or Hammerspoon if you want a reliable `Cmd+G`.
+4. After `brew install gtab`, the built-in hotkey helper should register `Cmd+G` automatically.
+5. If `Cmd+G` is not opening gtab, run `gtab hotkey doctor`.
 
 ### TUI shortcuts
 
@@ -68,7 +71,7 @@ a       save the current Ghostty window
 e       edit the selected workspace in $EDITOR
 d       delete the selected workspace
 t       open settings
-g       edit the Ghostty shortcut from Settings
+g       edit the global Cmd+G shortcut from Settings
 p       toggle the preview pane
 q       quit
 ```
@@ -89,11 +92,12 @@ Each workspace is stored as a plain AppleScript file (`.applescript`) that you c
 The `config` file in the same directory currently supports:
 
 - `close_tab=true|false`
+- `global_shortcut=cmd+g`
 - `ghostty_shortcut=off|cmd+shift+g`
 
-gtab also manages a launcher script at `~/.config/gtab/launcher.sh`. This is the recommended target for macOS shortcut tools because it opens a new Ghostty window and runs `gtab` directly.
+gtab also installs a user LaunchAgent and a companion helper binary (`gtab-hotkey`) to register a global macOS shortcut. The default `global_shortcut` is `cmd+g`.
 
-When you open the TUI or set `ghostty_shortcut`, gtab writes a managed Ghostty include at `~/.config/gtab/ghostty-shortcut.conf` and adds a `config-file` reference to your Ghostty config if needed. The recommended default is `off`, which disables the old text-injection shortcut so it does not conflict with launcher-based `Cmd+G`. If you set a real key combo there, that legacy shortcut sends `gtab` plus Enter to the focused Ghostty shell, so it can fail inside Claude Code, Codex, vim, or fzf.
+The old Ghostty text-injection shortcut is still available through `ghostty_shortcut`, but it is legacy-only. Keep it set to `off` unless you are debugging, because it just sends `gtab` plus Enter to the focused shell and can fail inside Claude Code, Codex, vim, or fzf.
 
 ---
 

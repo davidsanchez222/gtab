@@ -20,6 +20,10 @@ class Gtab < Formula
     system "cargo", "install", *std_cargo_args
   end
 
+  def post_install
+    system bin/"gtab", "hotkey", "install"
+  end
+
   test do
     ENV["GTAB_DIR"] = testpath/"gtab"
     (testpath/"gtab").mkpath
@@ -31,6 +35,7 @@ class Gtab < Formula
     assert_match version.to_s, shell_output("#{bin}/gtab --version")
     assert_match "demo", shell_output("#{bin}/gtab list")
     assert_match "close_tab = off", shell_output("#{bin}/gtab set")
+    assert_match "global_shortcut = cmd+g", shell_output("#{bin}/gtab set")
 
     system bin/"gtab", "set", "close_tab", "on"
     assert_match "close_tab = on", shell_output("#{bin}/gtab set")

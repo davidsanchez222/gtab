@@ -45,9 +45,11 @@ gtab save <name>     将当前 Ghostty 窗口保存为 workspace
 gtab list            列出所有已保存的 workspace
 gtab edit <name>     编辑某个 workspace 脚本
 gtab remove <name>   删除某个 workspace
-gtab shortcut        查看推荐的 macOS 快捷键 launcher
+gtab hotkey status   查看内建全局快捷键 helper 状态
+gtab hotkey doctor   查看全局快捷键 helper 诊断信息
 gtab set             查看设置
 gtab set close_tab on|off
+gtab set global_shortcut cmd+g
 gtab set ghostty_shortcut off|cmd+shift+g
 ```
 
@@ -56,7 +58,8 @@ gtab set ghostty_shortcut off|cmd+shift+g
 1. 在 Ghostty 中打开并布置好你的标签页。
 2. 运行 `gtab save myproject` 保存当前布局。
 3. 运行 `gtab` 打开 TUI，在其中搜索、预览或启动 workspace。
-4. 如果你想稳定地绑定 `Cmd+G`，运行 `gtab shortcut`，再把生成的 launcher 绑定到 Shortcuts、Raycast 或 Hammerspoon。
+4. `brew install gtab` 之后，内建的热键 helper 会负责默认的 `Cmd+G`。
+5. 如果 `Cmd+G` 没有打开 gtab，运行 `gtab hotkey doctor`。
 
 ### TUI 快捷键
 
@@ -68,7 +71,7 @@ a       保存当前 Ghostty 窗口
 e       用 $EDITOR 编辑当前 workspace
 d       删除当前 workspace
 t       打开设置
-g       在设置中编辑 Ghostty 快捷键
+g       在设置中编辑全局 Cmd+G 快捷键
 p       切换预览面板
 q       退出
 ```
@@ -89,11 +92,12 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 同目录下的 `config` 文件目前支持：
 
 - `close_tab=true|false`
+- `global_shortcut=cmd+g`
 - `ghostty_shortcut=off|cmd+shift+g`
 
-gtab 还会管理一个 launcher 脚本：`~/.config/gtab/launcher.sh`。这是推荐给 macOS 快捷键工具使用的入口，因为它会新开一个 Ghostty 窗口并直接运行 `gtab`。
+gtab 还会安装一个用户级 LaunchAgent 和配套 helper 二进制 `gtab-hotkey`，用于注册 macOS 全局快捷键。默认的 `global_shortcut` 是 `cmd+g`。
 
-当你打开 TUI 或设置 `ghostty_shortcut` 时，gtab 会写入一个受管理的 Ghostty include 文件 `~/.config/gtab/ghostty-shortcut.conf`，并在需要时把 `config-file` 引用加到 Ghostty 配置中。推荐默认值是 `off`，这样旧的文本注入快捷键就不会再和 launcher 版 `Cmd+G` 冲突。如果你把它设置成实际按键组合，这个旧方案仍然会向当前聚焦的 Ghostty shell 发送 `gtab` 加回车，所以在 Claude Code、Codex、vim 或 fzf 这类界面里可能失效。
+旧的 Ghostty 文本注入快捷键仍然可以通过 `ghostty_shortcut` 使用，但现在只作为兼容模式保留。除非你在调试，否则应保持为 `off`，因为它本质上只是向当前聚焦的 shell 发送 `gtab` 加回车，在 Claude Code、Codex、vim 或 fzf 这类界面里可能失效。
 
 ---
 

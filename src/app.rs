@@ -1,4 +1,4 @@
-use crate::core::{AppEnv, GhosttyShortcutSync, Workspace};
+use crate::core::{AppEnv, HotkeyAgentStatus, Workspace};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
@@ -119,12 +119,17 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                         }
                         Err(error) => app.set_error(error.to_string()),
                     },
-                    Action::SetGhosttyShortcut(shortcut) => {
-                        match env.set_ghostty_shortcut(&shortcut) {
-                            Ok(sync) => {
-                                app.reset_dialogs();
-                                app.set_success(shortcut_sync_message(&sync));
-                            }
+                    Action::SetGlobalShortcut(shortcut) => {
+                        match env.set_global_shortcut(&shortcut) {
+                            Ok(()) => match env.restart_hotkey_agent() {
+                                Ok(status) => {
+                                    app.reset_dialogs();
+                                    app.set_success(hotkey_status_message(&status));
+                                }
+                                Err(error) => app.set_error(format!(
+                                    "Saved global shortcut, but hotkey helper restart failed: {error}"
+                                )),
+                            },
                             Err(error) => app.set_error(error.to_string()),
                         }
                     }
@@ -221,7 +226,7 @@ enum Dialog {
     Save,
     ConfirmDelete,
     Settings,
-    EditGhosttyShortcut,
+    EditGlobalShortcut,
 }
 
 #[derive(Clone, Debug)]
@@ -422,7 +427,7 @@ impl App {
             Dialog::Save => self.handle_save_key(key),
             Dialog::ConfirmDelete => self.handle_delete_key(key),
             Dialog::Settings => self.handle_settings_key(key, env),
-            Dialog::EditGhosttyShortcut => self.handle_shortcut_key(key),
+            Dialog::EditGlobalShortcut => self.handle_shortcut_key(key),
             Dialog::None => self.handle_main_key(key, env),
         }
     }
@@ -480,8 +485,8 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::Char(' ') => Ok(Action::ToggleCloseTab),
             KeyCode::Char('g') => {
-                self.dialog = Dialog::EditGhosttyShortcut;
-                self.shortcut_input = env.ghostty_shortcut_display().to_string();
+                self.dialog = Dialog::EditGlobalShortcut;
+                self.shortcut_input = env.global_shortcut_display().to_string();
                 Ok(Action::None)
             }
             _ => Ok(Action::None),
@@ -498,11 +503,11 @@ impl App {
             KeyCode::Enter => {
                 let shortcut = self.shortcut_input.trim().to_string();
                 if shortcut.is_empty() {
-                    self.set_error("Ghostty shortcut cannot be empty");
+                    self.set_error("Global shortcut cannot be empty");
                     return Ok(Action::None);
                 }
 
-                Ok(Action::SetGhosttyShortcut(shortcut))
+                Ok(Action::SetGlobalShortcut(shortcut))
             }
             KeyCode::Backspace => {
                 self.shortcut_input.pop();
@@ -695,7 +700,7 @@ enum Action {
     Edit(String),
     Delete(String),
     ToggleCloseTab,
-    SetGhosttyShortcut(String),
+    SetGlobalShortcut(String),
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App, env: &AppEnv) {
@@ -722,7 +727,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, env: &AppEnv) {
         Dialog::Save => draw_save_dialog(frame, app),
         Dialog::ConfirmDelete => draw_delete_dialog(frame, app),
         Dialog::Settings => draw_settings_dialog(frame, env),
-        Dialog::EditGhosttyShortcut => draw_shortcut_dialog(frame, app, env),
+        Dialog::EditGlobalShortcut => draw_shortcut_dialog(frame, app, env),
     }
 }
 
@@ -997,8 +1002,8 @@ fn draw_delete_dialog(frame: &mut Frame<'_>, app: &App) {
 fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
     let area = centered_rect(72, 58, frame.area());
     let close_tab = if env.config.close_tab { "on" } else { "off" };
-    let launcher_path = env.launcher_path();
     let legacy_disabled = env.ghostty_shortcut_display() == "off";
+    let hotkey_status = env.hotkey_agent_status().ok();
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
@@ -1012,15 +1017,19 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
             Line::from("Close the current tab after launching a workspace."),
             Line::default(),
             Line::from(vec![
-                Span::styled("launcher", Style::default().fg(Color::Cyan)),
+                Span::styled("global_shortcut", Style::default().fg(Color::Cyan)),
                 Span::raw(" = "),
                 Span::styled(
-                    launcher_path.display().to_string(),
+                    env.global_shortcut_display(),
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
-            Line::from("Recommended: bind this script in Shortcuts, Raycast, or Hammerspoon."),
-            Line::from("It opens a new Ghostty window and runs `gtab`."),
+            Line::from("Handled by gtab's built-in macOS hotkey helper."),
+            Line::from(match hotkey_status.as_ref() {
+                Some(status) if status.loaded => "Hotkey helper is loaded.",
+                Some(_) => "Hotkey helper is not loaded. Run `gtab hotkey install`.",
+                None => "Hotkey helper status is unavailable.",
+            }),
             Line::default(),
             Line::from(vec![
                 Span::styled("ghostty_shortcut", Style::default().fg(Color::Cyan)),
@@ -1031,7 +1040,7 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
                 ),
             ]),
             Line::from(if legacy_disabled {
-                "Legacy mode is disabled to avoid conflicting with launcher-based Cmd+G."
+                "Legacy Ghostty text-injection shortcut is disabled."
             } else {
                 "Legacy mode: runs `gtab` in the focused Ghostty shell."
             }),
@@ -1045,11 +1054,9 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
             ),
             Line::default(),
             Line::from("Press c to toggle close_tab"),
-            Line::from("Press g to edit the Ghostty shortcut"),
-            Line::from("Run `gtab shortcut` for launcher binding instructions"),
-            Line::from(
-                "Reload Ghostty config or restart Ghostty after changing the legacy shortcut",
-            ),
+            Line::from("Press g to edit the global shortcut"),
+            Line::from("Run `gtab hotkey doctor` if Cmd+G is not opening gtab"),
+            Line::from("Use `gtab set ghostty_shortcut ...` only for legacy debugging"),
             Line::from("Enter or Esc to close"),
         ]))
         .block(Block::default().title("Settings").borders(Borders::ALL)),
@@ -1060,37 +1067,32 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
 fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
     let area = centered_rect(70, 46, frame.area());
     let current_input = if app.shortcut_input.is_empty() {
-        env.ghostty_shortcut_display()
+        env.global_shortcut_display()
     } else {
         app.shortcut_input.as_str()
     };
-    let launcher_path = env.launcher_path();
 
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
-            Line::from("Set the legacy Ghostty shortcut used to run `gtab`."),
+            Line::from("Set the built-in global shortcut used to open `gtab`."),
             Line::default(),
             Line::from(vec![
                 Span::styled("Shortcut: ", Style::default().fg(Color::Cyan)),
                 Span::raw(current_input),
             ]),
             Line::default(),
-            Line::from("Examples: off, cmd+shift+g, ctrl+alt+g"),
-            Line::from("This sends `gtab` plus Enter to the focused Ghostty shell."),
-            Line::from("It can fail when Claude Code, Codex, vim, or fzf owns the terminal."),
-            Line::default(),
-            Line::from(vec![
-                Span::styled("Launcher: ", Style::default().fg(Color::Cyan)),
-                Span::raw(launcher_path.display().to_string()),
-            ]),
-            Line::from("Recommended: bind the launcher in Shortcuts, Raycast, or Hammerspoon."),
+            Line::from("Examples: cmd+g, cmd+shift+g, ctrl+alt+g, off"),
+            Line::from("This is handled by the gtab hotkey helper, not Ghostty text injection."),
+            Line::from(
+                "After saving, gtab will restart the helper so the new shortcut takes effect.",
+            ),
             Line::default(),
             Line::from("Enter to save, Esc to cancel"),
         ]))
         .block(
             Block::default()
-                .title("Ghostty Shortcut")
+                .title("Global Shortcut")
                 .borders(Borders::ALL),
         ),
         area,
@@ -1117,19 +1119,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn shortcut_sync_message(sync: &GhosttyShortcutSync) -> String {
-    if sync.shortcut == "off" {
-        return format!(
-            "Legacy Ghostty shortcut disabled in {}. Use `gtab shortcut` for launcher setup.",
-            sync.include_path.display()
-        );
+fn hotkey_status_message(status: &HotkeyAgentStatus) -> String {
+    if status.loaded {
+        format!(
+            "Global shortcut {} is active via the gtab hotkey helper.",
+            status.global_shortcut
+        )
+    } else {
+        format!(
+            "Global shortcut saved as {}, but the hotkey helper is not loaded.",
+            status.global_shortcut
+        )
     }
-
-    format!(
-        "Legacy Ghostty shortcut {} saved to {}. Use `gtab shortcut` for Claude/Codex-safe launcher setup.",
-        sync.shortcut,
-        sync.include_path.display()
-    )
 }
 
 #[cfg(test)]

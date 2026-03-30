@@ -35,6 +35,25 @@ pub enum Commands {
         key: Option<String>,
         value: Option<String>,
     },
-    /// Show the recommended launcher for macOS shortcut tools.
+    /// Manage the built-in macOS hotkey helper.
+    Hotkey {
+        #[command(subcommand)]
+        command: Option<HotkeyCommands>,
+    },
+    /// Show the manual launcher fallback for external shortcut tools.
     Shortcut,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HotkeyCommands {
+    /// Install and start the user LaunchAgent.
+    Install,
+    /// Restart the hotkey helper after config changes.
+    Restart,
+    /// Show the current helper status.
+    Status,
+    /// Show diagnostics for the helper and launch agent.
+    Doctor,
+    /// Stop and remove the user LaunchAgent.
+    Uninstall,
 }

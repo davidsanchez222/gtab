@@ -7,13 +7,18 @@ use std::{
 };
 
 const APPLE_EXT: &str = "applescript";
+const DEFAULT_GLOBAL_SHORTCUT: &str = "cmd+g";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "off";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
 const LAUNCHER_SCRIPT_NAME: &str = "launcher.sh";
+const HOTKEY_SERVICE_LABEL: &str = "com.franvy.gtab.hotkey";
+const HOTKEY_PLIST_NAME: &str = "com.franvy.gtab.hotkey.plist";
+const HOTKEY_LOG_NAME: &str = "gtab-hotkey.log";
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub close_tab: bool,
+    pub global_shortcut: String,
     pub ghostty_shortcut: String,
 }
 
@@ -59,6 +64,11 @@ impl AppEnv {
 
     pub fn set_close_tab(&mut self, enabled: bool) -> Result<()> {
         self.config.close_tab = enabled;
+        self.write_config()
+    }
+
+    pub fn set_global_shortcut(&mut self, shortcut: &str) -> Result<()> {
+        self.config.global_shortcut = normalize_global_shortcut(shortcut)?;
         self.write_config()
     }
 
@@ -188,8 +198,77 @@ impl AppEnv {
         if self.config.close_tab { "on" } else { "off" }
     }
 
+    pub fn global_shortcut_display(&self) -> &str {
+        &self.config.global_shortcut
+    }
+
     pub fn ghostty_shortcut_display(&self) -> &str {
         &self.config.ghostty_shortcut
+    }
+
+    pub fn hotkey_plist_path(&self) -> Result<PathBuf> {
+        let home = home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
+        Ok(home.join("Library/LaunchAgents").join(HOTKEY_PLIST_NAME))
+    }
+
+    pub fn hotkey_log_path(&self) -> PathBuf {
+        self.base_dir.join(HOTKEY_LOG_NAME)
+    }
+
+    pub fn helper_binary_path(&self) -> Result<PathBuf> {
+        let current = env::current_exe().context("failed to resolve current executable")?;
+        let Some(parent) = current.parent() else {
+            bail!("failed to resolve executable directory");
+        };
+
+        let helper = parent.join("gtab-hotkey");
+        if helper.exists() {
+            return Ok(helper);
+        }
+
+        bail!("gtab-hotkey helper not found next to {}", current.display())
+    }
+
+    pub fn install_hotkey_agent(&self) -> Result<HotkeyAgentStatus> {
+        let plist_path = self.hotkey_plist_path()?;
+        self.write_hotkey_plist(&plist_path)?;
+        self.bootout_hotkey_agent().ok();
+        self.bootstrap_hotkey_agent()?;
+        self.kickstart_hotkey_agent()?;
+        self.hotkey_agent_status()
+    }
+
+    pub fn restart_hotkey_agent(&self) -> Result<HotkeyAgentStatus> {
+        self.write_hotkey_plist(&self.hotkey_plist_path()?)?;
+        if !self.launchctl_print().success() {
+            return self.install_hotkey_agent();
+        }
+
+        self.kickstart_hotkey_agent()?;
+        self.hotkey_agent_status()
+    }
+
+    pub fn uninstall_hotkey_agent(&self) -> Result<()> {
+        let plist_path = self.hotkey_plist_path()?;
+        self.bootout_hotkey_agent().ok();
+        if plist_path.exists() {
+            fs::remove_file(&plist_path)
+                .with_context(|| format!("failed to remove {}", plist_path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn hotkey_agent_status(&self) -> Result<HotkeyAgentStatus> {
+        let plist_path = self.hotkey_plist_path()?;
+        let helper_path = self.helper_binary_path()?;
+        let loaded = self.launchctl_print().success();
+
+        Ok(HotkeyAgentStatus {
+            global_shortcut: self.config.global_shortcut.clone(),
+            plist_path,
+            helper_path,
+            loaded,
+        })
     }
 
     pub fn preview_ghostty_shortcut_sync(&self) -> GhosttyShortcutSync {
@@ -254,6 +333,108 @@ impl AppEnv {
         Ok(changed)
     }
 
+    fn write_hotkey_plist(&self, path: &Path) -> Result<bool> {
+        let helper_path = self.helper_binary_path()?;
+        let log_path = self.hotkey_log_path();
+        let content = build_hotkey_launch_agent_plist(&helper_path, &log_path);
+        let mut changed = false;
+
+        if fs::read_to_string(path).ok().as_deref() != Some(content.as_str()) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+
+            fs::write(path, content)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            changed = true;
+        }
+
+        Ok(changed)
+    }
+
+    fn launchctl_domain(&self) -> Result<String> {
+        let output = Command::new("id")
+            .arg("-u")
+            .output()
+            .context("failed to resolve current user id")?;
+
+        if !output.status.success() {
+            bail!("failed to resolve current user id");
+        }
+
+        let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if uid.is_empty() {
+            bail!("failed to resolve current user id");
+        }
+
+        Ok(format!("gui/{uid}"))
+    }
+
+    fn bootstrap_hotkey_agent(&self) -> Result<()> {
+        let plist_path = self.hotkey_plist_path()?;
+        let domain = self.launchctl_domain()?;
+        let status = Command::new("launchctl")
+            .args(["bootstrap", &domain])
+            .arg(&plist_path)
+            .status()
+            .with_context(|| format!("failed to bootstrap {}", plist_path.display()))?;
+
+        if !status.success() {
+            bail!("failed to bootstrap hotkey agent");
+        }
+
+        Ok(())
+    }
+
+    fn bootout_hotkey_agent(&self) -> Result<()> {
+        let plist_path = self.hotkey_plist_path()?;
+        let domain = self.launchctl_domain()?;
+        let status = Command::new("launchctl")
+            .args(["bootout", &domain])
+            .arg(&plist_path)
+            .status()
+            .with_context(|| format!("failed to stop {}", plist_path.display()))?;
+
+        if !status.success() {
+            bail!("failed to stop hotkey agent");
+        }
+
+        Ok(())
+    }
+
+    fn kickstart_hotkey_agent(&self) -> Result<()> {
+        let domain = self.launchctl_domain()?;
+        let status = Command::new("launchctl")
+            .args([
+                "kickstart",
+                "-k",
+                &format!("{domain}/{HOTKEY_SERVICE_LABEL}"),
+            ])
+            .status()
+            .context("failed to kickstart hotkey agent")?;
+
+        if !status.success() {
+            bail!("failed to kickstart hotkey agent");
+        }
+
+        Ok(())
+    }
+
+    fn launchctl_print(&self) -> std::process::ExitStatus {
+        let Ok(domain) = self.launchctl_domain() else {
+            return exit_status_from_code(1);
+        };
+
+        match Command::new("launchctl")
+            .args(["print", &format!("{domain}/{HOTKEY_SERVICE_LABEL}")])
+            .output()
+        {
+            Ok(output) => output.status,
+            Err(_) => exit_status_from_code(1),
+        }
+    }
+
     fn write_config(&mut self) -> Result<()> {
         if let Some(parent) = self.config_file.parent() {
             fs::create_dir_all(parent)
@@ -264,6 +445,10 @@ impl AppEnv {
             .with_context(|| format!("failed to write {}", self.config_file.display()))?;
         self.reload_config()
     }
+}
+
+pub fn hotkey_service_label() -> &'static str {
+    HOTKEY_SERVICE_LABEL
 }
 
 impl Config {
@@ -283,6 +468,8 @@ impl Config {
 
             if key.trim() == "close_tab" {
                 config.close_tab = matches!(value.trim(), "true" | "on");
+            } else if key.trim() == "global_shortcut" && !value.trim().is_empty() {
+                config.global_shortcut = normalize_global_shortcut(value.trim())?;
             } else if key.trim() == "ghostty_shortcut" && !value.trim().is_empty() {
                 config.ghostty_shortcut = normalize_ghostty_shortcut(value.trim())?;
             }
@@ -294,8 +481,8 @@ impl Config {
     fn serialize(&self) -> String {
         let close_tab = if self.close_tab { "true" } else { "false" };
         format!(
-            "close_tab={close_tab}\nghostty_shortcut={}\n",
-            self.ghostty_shortcut
+            "close_tab={close_tab}\nglobal_shortcut={}\nghostty_shortcut={}\n",
+            self.global_shortcut, self.ghostty_shortcut
         )
     }
 }
@@ -304,6 +491,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             close_tab: false,
+            global_shortcut: DEFAULT_GLOBAL_SHORTCUT.to_string(),
             ghostty_shortcut: DEFAULT_GHOSTTY_SHORTCUT.to_string(),
         }
     }
@@ -355,13 +543,32 @@ fn validate_workspace_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalize_global_shortcut(shortcut: &str) -> Result<String> {
+    let normalized = shortcut.trim().to_lowercase();
+    if normalized.is_empty() {
+        bail!("global_shortcut cannot be empty");
+    }
+
+    if is_shortcut_disabled(&normalized) {
+        return Ok("off".to_string());
+    }
+
+    if normalized.contains('=') || normalized.contains('\n') || normalized.contains('\r') {
+        bail!("global_shortcut contains invalid characters");
+    }
+
+    let _ = parse_global_hotkey(&normalized)?;
+
+    Ok(normalized)
+}
+
 fn normalize_ghostty_shortcut(shortcut: &str) -> Result<String> {
     let normalized = shortcut.trim().to_lowercase();
     if normalized.is_empty() {
         bail!("ghostty_shortcut cannot be empty");
     }
 
-    if is_ghostty_shortcut_disabled(&normalized) {
+    if is_shortcut_disabled(&normalized) {
         return Ok(DEFAULT_GHOSTTY_SHORTCUT.to_string());
     }
 
@@ -372,8 +579,83 @@ fn normalize_ghostty_shortcut(shortcut: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn is_ghostty_shortcut_disabled(shortcut: &str) -> bool {
+fn is_shortcut_disabled(shortcut: &str) -> bool {
     matches!(shortcut.trim(), "off" | "none" | "disabled")
+}
+
+pub fn parse_global_hotkey(shortcut: &str) -> Result<Option<ParsedHotkey>> {
+    let normalized = shortcut.trim().to_lowercase();
+    if is_shortcut_disabled(&normalized) {
+        return Ok(None);
+    }
+
+    let mut modifiers = 0u32;
+    let mut key = None;
+
+    for part in normalized.split('+') {
+        match part.trim() {
+            "cmd" | "command" => modifiers |= 1 << 8,
+            "shift" => modifiers |= 1 << 9,
+            "alt" | "option" => modifiers |= 1 << 11,
+            "ctrl" | "control" => modifiers |= 1 << 12,
+            value if !value.is_empty() && key.is_none() => key = Some(value),
+            _ => bail!("unsupported global_shortcut: {shortcut}"),
+        }
+    }
+
+    let Some(key) = key else {
+        bail!("global_shortcut must include a key");
+    };
+
+    let key_code = key_code_for_shortcut(key)
+        .ok_or_else(|| anyhow!("unsupported global_shortcut key: {key}"))?;
+
+    Ok(Some(ParsedHotkey {
+        key_code,
+        modifiers,
+    }))
+}
+
+fn key_code_for_shortcut(key: &str) -> Option<u32> {
+    Some(match key {
+        "a" => 0x00,
+        "s" => 0x01,
+        "d" => 0x02,
+        "f" => 0x03,
+        "h" => 0x04,
+        "g" => 0x05,
+        "z" => 0x06,
+        "x" => 0x07,
+        "c" => 0x08,
+        "v" => 0x09,
+        "b" => 0x0B,
+        "q" => 0x0C,
+        "w" => 0x0D,
+        "e" => 0x0E,
+        "r" => 0x0F,
+        "y" => 0x10,
+        "t" => 0x11,
+        "1" => 0x12,
+        "2" => 0x13,
+        "3" => 0x14,
+        "4" => 0x15,
+        "6" => 0x16,
+        "5" => 0x17,
+        "9" => 0x19,
+        "7" => 0x1A,
+        "8" => 0x1C,
+        "0" => 0x1D,
+        "o" => 0x1F,
+        "u" => 0x20,
+        "i" => 0x22,
+        "p" => 0x23,
+        "l" => 0x25,
+        "j" => 0x26,
+        "k" => 0x28,
+        "n" => 0x2D,
+        "m" => 0x2E,
+        _ => return None,
+    })
 }
 
 fn capture_ghostty_tabs() -> Result<Vec<TabRow>> {
@@ -574,7 +856,7 @@ fn apple_escape(value: &str) -> String {
 }
 
 fn build_ghostty_shortcut_include(shortcut: &str) -> String {
-    if is_ghostty_shortcut_disabled(shortcut) {
+    if is_shortcut_disabled(shortcut) {
         return "# Managed by gtab. Update this in gtab settings.\n# Legacy Ghostty text-injection shortcut is disabled.\n".to_string();
     }
 
@@ -601,6 +883,49 @@ fi
 exec open -na Ghostty.app --args -e "$GTAB_BIN"
 "#
     .to_string()
+}
+
+fn build_hotkey_launch_agent_plist(helper_path: &Path, log_path: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{HOTKEY_SERVICE_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{}</string>
+  <key>StandardErrorPath</key>
+  <string>{}</string>
+</dict>
+</plist>
+"#,
+        helper_path.display(),
+        log_path.display(),
+        log_path.display()
+    )
+}
+
+fn exit_status_from_code(code: i32) -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = code;
+        unreachable!()
+    }
 }
 
 fn ensure_ghostty_include_reference(config_path: &Path, include_path: &Path) -> Result<bool> {
@@ -658,6 +983,20 @@ pub struct GhosttyShortcutSync {
     pub config_path: PathBuf,
     pub include_path: PathBuf,
     pub shortcut: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HotkeyAgentStatus {
+    pub global_shortcut: String,
+    pub plist_path: PathBuf,
+    pub helper_path: PathBuf,
+    pub loaded: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParsedHotkey {
+    pub key_code: u32,
+    pub modifiers: u32,
 }
 
 fn run_osascript(script: &str) -> Result<String> {
@@ -734,16 +1073,22 @@ pub fn format_workspace_list(workspaces: &[Workspace]) -> String {
 
 pub fn format_settings(env: &AppEnv) -> String {
     let close_tab = if env.config.close_tab { "on" } else { "off" };
-    let legacy_note = if is_ghostty_shortcut_disabled(&env.config.ghostty_shortcut) {
-        "Legacy Ghostty shortcut is disabled to avoid conflicting with launcher-based Cmd+G."
+    let legacy_note = if is_shortcut_disabled(&env.config.ghostty_shortcut) {
+        "Legacy Ghostty shortcut is disabled so the built-in global Cmd+G helper can own the shortcut."
     } else {
         "Legacy Ghostty shortcut sends `gtab` to the focused shell and can fail in Claude Code/Codex."
     };
 
     format!(
-        "Settings:\n  close_tab = {close_tab}\n  launcher = {}\n  ghostty_shortcut = {}\n  Recommended: bind `gtab shortcut` in Shortcuts, Raycast, or Hammerspoon.\n  {legacy_note}",
-        env.launcher_path().display(),
-        env.config.ghostty_shortcut
+        "Settings:\n  close_tab = {close_tab}\n  global_shortcut = {}\n  ghostty_shortcut = {}\n  launch_agent = {}\n  helper = {}\n  {legacy_note}",
+        env.config.global_shortcut,
+        env.config.ghostty_shortcut,
+        env.hotkey_plist_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "~".to_string()),
+        env.helper_binary_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "gtab-hotkey".to_string())
     )
 }
 
@@ -755,19 +1100,65 @@ pub fn format_shortcut_guide(env: &AppEnv, launcher_path: &Path) -> String {
     )
 }
 
+pub fn format_hotkey_status(status: &HotkeyAgentStatus, legacy_shortcut: &str) -> String {
+    let loaded = if status.loaded {
+        "loaded"
+    } else {
+        "not loaded"
+    };
+    format!(
+        "Hotkey Agent:\n  global_shortcut = {}\n  service = {HOTKEY_SERVICE_LABEL} ({loaded})\n  plist = {}\n  helper = {}\n  legacy_ghostty_shortcut = {}",
+        status.global_shortcut,
+        status.plist_path.display(),
+        status.helper_path.display(),
+        legacy_shortcut
+    )
+}
+
+pub fn format_hotkey_doctor(
+    status: &HotkeyAgentStatus,
+    legacy_shortcut: &str,
+    log_path: &Path,
+) -> String {
+    let launchd_state = if status.loaded {
+        "launchd service is loaded"
+    } else {
+        "launchd service is not loaded"
+    };
+    let legacy_state = if is_shortcut_disabled(legacy_shortcut) {
+        "legacy Ghostty text-injection shortcut is disabled"
+    } else {
+        "legacy Ghostty text-injection shortcut is still enabled"
+    };
+
+    format!(
+        "Hotkey Doctor:\n  shortcut = {}\n  {launchd_state}\n  {legacy_state}\n  plist = {}\n  helper = {}\n  log = {}\n  Press Cmd+G in Ghostty to test after reload/restart.",
+        status.global_shortcut,
+        status.plist_path.display(),
+        status.helper_path.display(),
+        log_path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, TabRow, apple_escape, build_ghostty_shortcut_include, build_launcher_script,
-        build_workspace_script, parse_workspace_tabs,
+        Config, HOTKEY_SERVICE_LABEL, TabRow, apple_escape, build_ghostty_shortcut_include,
+        build_hotkey_launch_agent_plist, build_launcher_script, build_workspace_script,
+        parse_workspace_tabs,
     };
 
     #[test]
     fn config_parses_close_tab_truthy_values() {
         let path = tempfile_path("config");
-        std::fs::write(&path, "close_tab=true\nghostty_shortcut=cmd+shift+g\n").unwrap();
+        std::fs::write(
+            &path,
+            "close_tab=true\nglobal_shortcut=cmd+g\nghostty_shortcut=cmd+shift+g\n",
+        )
+        .unwrap();
         let config = Config::load(&path).unwrap();
         assert!(config.close_tab);
+        assert_eq!(config.global_shortcut, "cmd+g");
         assert_eq!(config.ghostty_shortcut, "cmd+shift+g");
         let _ = std::fs::remove_file(path);
     }
@@ -775,10 +1166,17 @@ mod tests {
     #[test]
     fn config_normalizes_disabled_ghostty_shortcut() {
         let path = tempfile_path("config-off");
-        std::fs::write(&path, "ghostty_shortcut=disabled\n").unwrap();
+        std::fs::write(&path, "global_shortcut=cmd+g\nghostty_shortcut=disabled\n").unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(config.ghostty_shortcut, "off");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_defaults_global_shortcut_to_cmd_g() {
+        let config = Config::default();
+        assert_eq!(config.global_shortcut, "cmd+g");
+        assert_eq!(config.ghostty_shortcut, "off");
     }
 
     #[test]
@@ -849,6 +1247,17 @@ end tell
         assert!(script.contains("command -v gtab"));
         assert!(script.contains("/opt/homebrew/bin/gtab"));
         assert!(script.contains("open -na Ghostty.app --args -e \"$GTAB_BIN\""));
+    }
+
+    #[test]
+    fn launch_agent_plist_points_to_helper_binary() {
+        let plist = build_hotkey_launch_agent_plist(
+            std::path::Path::new("/opt/homebrew/bin/gtab-hotkey"),
+            std::path::Path::new("/tmp/gtab-hotkey.log"),
+        );
+        assert!(plist.contains(HOTKEY_SERVICE_LABEL));
+        assert!(plist.contains("/opt/homebrew/bin/gtab-hotkey"));
+        assert!(plist.contains("/tmp/gtab-hotkey.log"));
     }
 
     fn tempfile_path(name: &str) -> std::path::PathBuf {
