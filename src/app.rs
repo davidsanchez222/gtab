@@ -1,8 +1,11 @@
-use crate::core::{AppEnv, Workspace};
+use crate::core::{AppEnv, GhosttyShortcutSync, Workspace};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -23,10 +26,20 @@ const SPLASH_MS: u64 = 850;
 
 pub fn run_tui(env: &mut AppEnv) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
+    let sync_status = env.ensure_ghostty_shortcut();
     let mut app = App::new(env.list_workspaces()?);
 
+    match sync_status {
+        Ok(true) => app.set_info(format!(
+            "Ghostty shortcut {} synced. Reload Ghostty config or restart Ghostty.",
+            env.ghostty_shortcut_display()
+        )),
+        Ok(false) => {}
+        Err(error) => app.set_error(format!("Ghostty shortcut sync failed: {error}")),
+    }
+
     loop {
-        terminal.draw(|frame| draw(frame, &app, env))?;
+        terminal.draw(|frame| draw(frame, &mut app, env))?;
 
         if let Some(expiry) = app.status_expiry {
             if Instant::now() >= expiry {
@@ -38,76 +51,106 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
             continue;
         }
 
-        let Event::Key(key) = event::read().context("failed to read terminal event")? else {
-            continue;
+        match event::read().context("failed to read terminal event")? {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if app.is_splash_visible() {
+                    app.dismiss_splash();
+                    continue;
+                }
+
+                match app.handle_key(key, env)? {
+                    Action::None => {}
+                    Action::Quit => break,
+                    Action::Launch(name) => {
+                        terminal.suspend()?;
+                        let result = env.launch_workspace(&name);
+                        terminal.resume()?;
+                        result?;
+                        break;
+                    }
+                    Action::Save(name) => {
+                        terminal.suspend()?;
+                        let result = env.save_current_window(&name);
+                        terminal.resume()?;
+
+                        match result {
+                            Ok(path) => {
+                                app.reset_dialogs();
+                                app.reload(env.list_workspaces()?);
+                                app.select_name(&name);
+                                app.set_success(format!(
+                                    "Saved workspace \"{name}\" to {}",
+                                    path.display()
+                                ));
+                            }
+                            Err(error) => {
+                                app.set_error(error.to_string());
+                            }
+                        }
+                    }
+                    Action::Edit(name) => {
+                        terminal.suspend()?;
+                        let result = env.open_in_editor(&name);
+                        terminal.resume()?;
+
+                        match result {
+                            Ok(()) => {
+                                app.reload(env.list_workspaces()?);
+                                app.select_name(&name);
+                                app.set_success(format!("Closed editor for \"{name}\""));
+                            }
+                            Err(error) => app.set_error(error.to_string()),
+                        }
+                    }
+                    Action::Delete(name) => match env.remove_workspace(&name) {
+                        Ok(_) => {
+                            app.reset_dialogs();
+                            app.reload(env.list_workspaces()?);
+                            app.set_success(format!("Removed workspace \"{name}\""));
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    },
+                    Action::ToggleCloseTab => match env.set_close_tab(!env.config.close_tab) {
+                        Ok(()) => {
+                            app.set_success(format!("close_tab = {}", env.close_tab_display()))
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    },
+                    Action::SetGhosttyShortcut(shortcut) => {
+                        match env.set_ghostty_shortcut(&shortcut) {
+                            Ok(sync) => {
+                                app.reset_dialogs();
+                                app.set_success(shortcut_sync_message(&sync));
+                            }
+                            Err(error) => app.set_error(error.to_string()),
+                        }
+                    }
+                }
+            }
+            Event::Mouse(mouse) => {
+                if app.is_splash_visible() {
+                    app.dismiss_splash();
+                    continue;
+                }
+
+                match app.handle_mouse(mouse)? {
+                    Action::None => {}
+                    Action::Launch(name) => {
+                        terminal.suspend()?;
+                        let result = env.launch_workspace(&name);
+                        terminal.resume()?;
+                        result?;
+                        break;
+                    }
+                    action => unreachable!("unexpected mouse action: {action:?}"),
+                }
+            }
+            _ => continue,
         };
-
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        if app.is_splash_visible() {
-            app.dismiss_splash();
-            continue;
-        }
-
-        match app.handle_key(key, env)? {
-            Action::None => {}
-            Action::Quit => break,
-            Action::Launch(name) => {
-                terminal.suspend()?;
-                let result = env.launch_workspace(&name);
-                terminal.resume()?;
-                result?;
-                break;
-            }
-            Action::Save(name) => {
-                terminal.suspend()?;
-                let result = env.save_current_window(&name);
-                terminal.resume()?;
-
-                match result {
-                    Ok(path) => {
-                        app.reset_dialogs();
-                        app.reload(env.list_workspaces()?);
-                        app.select_name(&name);
-                        app.set_success(format!(
-                            "Saved workspace \"{name}\" to {}",
-                            path.display()
-                        ));
-                    }
-                    Err(error) => {
-                        app.set_error(error.to_string());
-                    }
-                }
-            }
-            Action::Edit(name) => {
-                terminal.suspend()?;
-                let result = env.open_in_editor(&name);
-                terminal.resume()?;
-
-                match result {
-                    Ok(()) => {
-                        app.reload(env.list_workspaces()?);
-                        app.select_name(&name);
-                        app.set_success(format!("Closed editor for \"{name}\""));
-                    }
-                    Err(error) => app.set_error(error.to_string()),
-                }
-            }
-            Action::Delete(name) => match env.remove_workspace(&name) {
-                Ok(_) => {
-                    app.reset_dialogs();
-                    app.reload(env.list_workspaces()?);
-                    app.set_success(format!("Removed workspace \"{name}\""));
-                }
-                Err(error) => app.set_error(error.to_string()),
-            },
-            Action::ToggleCloseTab => match env.set_close_tab(!env.config.close_tab) {
-                Ok(()) => app.set_success(format!("close_tab = {}", env.close_tab_display())),
-                Err(error) => app.set_error(error.to_string()),
-            },
-        }
     }
 
     Ok(())
@@ -121,7 +164,8 @@ impl TerminalSession {
     fn start() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, Hide).context("failed to enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)
+            .context("failed to enter alternate screen")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
             .context("failed to initialize terminal backend")?;
         Ok(Self { terminal })
@@ -134,15 +178,25 @@ impl TerminalSession {
 
     fn suspend(&mut self) -> Result<()> {
         disable_raw_mode().context("failed to disable raw mode")?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show)
-            .context("failed to leave alternate screen")?;
+        execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            Show
+        )
+        .context("failed to leave alternate screen")?;
         self.terminal.show_cursor().ok();
         Ok(())
     }
 
     fn resume(&mut self) -> Result<()> {
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen, Hide)
-            .context("failed to re-enter alternate screen")?;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            Hide
+        )
+        .context("failed to re-enter alternate screen")?;
         enable_raw_mode().context("failed to re-enable raw mode")?;
         self.terminal.clear().ok();
         Ok(())
@@ -152,7 +206,12 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            Show
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -163,6 +222,7 @@ enum Dialog {
     Save,
     ConfirmDelete,
     Settings,
+    EditGhosttyShortcut,
 }
 
 #[derive(Clone, Debug)]
@@ -182,10 +242,13 @@ struct StatusLine {
 struct App {
     workspaces: Vec<Workspace>,
     selected: usize,
+    list_offset: usize,
+    list_area: Rect,
     filter: String,
     show_preview: bool,
     dialog: Dialog,
     save_input: String,
+    shortcut_input: String,
     splash_started_at: Instant,
     splash_visible: bool,
     status: Option<StatusLine>,
@@ -197,15 +260,19 @@ impl App {
         Self {
             workspaces,
             selected: 0,
+            list_offset: 0,
+            list_area: Rect::default(),
             filter: String::new(),
             show_preview: true,
             dialog: Dialog::None,
             save_input: String::new(),
+            shortcut_input: String::new(),
             splash_started_at: Instant::now(),
             splash_visible: true,
             status: Some(StatusLine {
                 kind: StatusKind::Info,
-                text: "Type to filter, Enter to launch, s to save, t for settings.".to_string(),
+                text: "Click or Enter to launch, w/s to move, a to save, t for settings."
+                    .to_string(),
             }),
             status_expiry: None,
         }
@@ -219,6 +286,7 @@ impl App {
     fn reset_dialogs(&mut self) {
         self.dialog = Dialog::None;
         self.save_input.clear();
+        self.shortcut_input.clear();
     }
 
     fn dismiss_splash(&mut self) {
@@ -308,6 +376,10 @@ impl App {
         self.set_status(StatusKind::Success, text);
     }
 
+    fn set_info(&mut self, text: impl Into<String>) {
+        self.set_status(StatusKind::Info, text);
+    }
+
     fn set_error(&mut self, text: impl Into<String>) {
         self.set_status(StatusKind::Error, text);
     }
@@ -325,7 +397,8 @@ impl App {
         match self.dialog {
             Dialog::Save => self.handle_save_key(key),
             Dialog::ConfirmDelete => self.handle_delete_key(key),
-            Dialog::Settings => self.handle_settings_key(key),
+            Dialog::Settings => self.handle_settings_key(key, env),
+            Dialog::EditGhosttyShortcut => self.handle_shortcut_key(key),
             Dialog::None => self.handle_main_key(key, env),
         }
     }
@@ -375,13 +448,46 @@ impl App {
         }
     }
 
-    fn handle_settings_key(&mut self, key: KeyEvent) -> Result<Action> {
+    fn handle_settings_key(&mut self, key: KeyEvent, env: &AppEnv) -> Result<Action> {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 self.reset_dialogs();
                 Ok(Action::None)
             }
             KeyCode::Char('c') | KeyCode::Char(' ') => Ok(Action::ToggleCloseTab),
+            KeyCode::Char('g') => {
+                self.dialog = Dialog::EditGhosttyShortcut;
+                self.shortcut_input = env.ghostty_shortcut_display().to_string();
+                Ok(Action::None)
+            }
+            _ => Ok(Action::None),
+        }
+    }
+
+    fn handle_shortcut_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.dialog = Dialog::Settings;
+                self.shortcut_input.clear();
+                Ok(Action::None)
+            }
+            KeyCode::Enter => {
+                let shortcut = self.shortcut_input.trim().to_string();
+                if shortcut.is_empty() {
+                    self.set_error("Ghostty shortcut cannot be empty");
+                    return Ok(Action::None);
+                }
+
+                Ok(Action::SetGhosttyShortcut(shortcut))
+            }
+            KeyCode::Backspace => {
+                self.shortcut_input.pop();
+                Ok(Action::None)
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.shortcut_input.push(c);
+                Ok(Action::None)
+            }
             _ => Ok(Action::None),
         }
     }
@@ -407,11 +513,11 @@ impl App {
 
                 Ok(Action::Quit)
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('s') => {
                 self.move_selection(1);
                 Ok(Action::None)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('w') => {
                 self.move_selection(-1);
                 Ok(Action::None)
             }
@@ -433,7 +539,7 @@ impl App {
                 };
                 Ok(Action::Launch(workspace.name.clone()))
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('a') => {
                 self.dialog = Dialog::Save;
                 self.save_input.clear();
                 Ok(Action::None)
@@ -472,6 +578,36 @@ impl App {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Action> {
+        if !matches!(self.dialog, Dialog::None) {
+            return Ok(Action::None);
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = self.list_index_at(mouse.column, mouse.row) else {
+                    return Ok(Action::None);
+                };
+
+                self.selected = index;
+                let Some(workspace) = self.selected_workspace() else {
+                    return Ok(Action::None);
+                };
+
+                Ok(Action::Launch(workspace.name.clone()))
+            }
+            MouseEventKind::ScrollDown if self.list_contains(mouse.column, mouse.row) => {
+                self.move_selection(1);
+                Ok(Action::None)
+            }
+            MouseEventKind::ScrollUp if self.list_contains(mouse.column, mouse.row) => {
+                self.move_selection(-1);
+                Ok(Action::None)
+            }
+            _ => Ok(Action::None),
+        }
+    }
+
     fn should_extend_filter(&self, c: char) -> bool {
         if c.is_ascii_uppercase() || c.is_ascii_digit() {
             return true;
@@ -483,8 +619,26 @@ impl App {
 
         !self.filter.is_empty() && c.is_ascii_lowercase()
     }
+
+    fn list_index_at(&self, column: u16, row: u16) -> Option<usize> {
+        if !self.list_contains(column, row) {
+            return None;
+        }
+
+        let relative_row = row.saturating_sub(self.list_area.y) as usize;
+        let index = self.list_offset + relative_row;
+        (index < self.visible_indices().len()).then_some(index)
+    }
+
+    fn list_contains(&self, column: u16, row: u16) -> bool {
+        column >= self.list_area.x
+            && column < self.list_area.x.saturating_add(self.list_area.width)
+            && row >= self.list_area.y
+            && row < self.list_area.y.saturating_add(self.list_area.height)
+    }
 }
 
+#[derive(Debug)]
 enum Action {
     None,
     Quit,
@@ -493,9 +647,10 @@ enum Action {
     Edit(String),
     Delete(String),
     ToggleCloseTab,
+    SetGhosttyShortcut(String),
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
+fn draw(frame: &mut Frame<'_>, app: &mut App, env: &AppEnv) {
     if app.is_splash_visible() {
         draw_splash(frame, app);
         return;
@@ -519,6 +674,7 @@ fn draw(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
         Dialog::Save => draw_save_dialog(frame, app),
         Dialog::ConfirmDelete => draw_delete_dialog(frame, app),
         Dialog::Settings => draw_settings_dialog(frame, env),
+        Dialog::EditGhosttyShortcut => draw_shortcut_dialog(frame, app, env),
     }
 }
 
@@ -586,7 +742,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App, env: &AppEnv) {
     );
 }
 
-fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let show_preview = app.show_preview && area.width >= 90;
     let chunks = if show_preview {
         Layout::default()
@@ -607,7 +763,8 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    app.list_area = Block::default().borders(Borders::ALL).inner(area);
     let visible = app.visible_workspaces();
     let items: Vec<ListItem<'_>> = if visible.is_empty() {
         vec![ListItem::new(Line::from("No workspaces found"))]
@@ -618,12 +775,15 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect()
     };
 
-    let mut state =
-        ListState::default().with_selected((!visible.is_empty()).then_some(app.selected));
     let title = format!("Workspaces ({})", visible.len());
+    let block = Block::default().borders(Borders::ALL).title(title);
+
+    let mut state = ListState::default()
+        .with_selected((!visible.is_empty()).then_some(app.selected))
+        .with_offset(app.list_offset);
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(block)
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -633,17 +793,43 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .highlight_symbol("›");
 
     frame.render_stateful_widget(list, area, &mut state);
+    app.list_offset = state.offset();
 }
 
 fn draw_preview(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let text = match app.selected_workspace() {
-        Some(workspace) => match std::fs::read_to_string(&workspace.path) {
-            Ok(content) => Text::from(content),
-            Err(error) => Text::from(error.to_string()),
-        },
-        None => Text::from(
-            "No workspace selected.\n\nUse s to save the current Ghostty window or clear the filter.",
-        ),
+        Some(workspace) if workspace.tabs.is_empty() => Text::from(vec![
+            Line::from(format!("Workspace: {}", workspace.name)),
+            Line::default(),
+            Line::from("No tab titles were found in this workspace yet."),
+        ]),
+        Some(workspace) => {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("Workspace: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&workspace.name, Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Tabs: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        workspace.tabs.len().to_string(),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::default(),
+            ];
+
+            lines.extend(
+                workspace
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tab)| Line::from(format!("{}. {}", index + 1, tab))),
+            );
+
+            Text::from(lines)
+        }
+        None => Text::from("No workspace selected.\n\nUse a to save one or clear the filter."),
     };
 
     frame.render_widget(
@@ -673,9 +859,13 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_else(|| Line::from("Ready"));
 
     let keys = Line::from(vec![
+        Span::styled("click", Style::default().fg(Color::Cyan)),
+        Span::raw(" launch  "),
         Span::styled("Enter", Style::default().fg(Color::Cyan)),
         Span::raw(" launch  "),
-        Span::styled("s", Style::default().fg(Color::Cyan)),
+        Span::styled("w/s", Style::default().fg(Color::Cyan)),
+        Span::raw(" move  "),
+        Span::styled("a", Style::default().fg(Color::Cyan)),
         Span::raw(" save  "),
         Span::styled("e", Style::default().fg(Color::Cyan)),
         Span::raw(" edit  "),
@@ -755,7 +945,7 @@ fn draw_delete_dialog(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
-    let area = centered_rect(55, 24, frame.area());
+    let area = centered_rect(62, 32, frame.area());
     let close_tab = if env.config.close_tab { "on" } else { "off" };
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -769,10 +959,55 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
             ]),
             Line::from("Close the current tab after launching a workspace."),
             Line::default(),
-            Line::from("Press c or Space to toggle"),
+            Line::from(vec![
+                Span::styled("ghostty_shortcut", Style::default().fg(Color::Cyan)),
+                Span::raw(" = "),
+                Span::styled(
+                    env.ghostty_shortcut_display(),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Line::from("Runs `gtab` in the focused Ghostty shell."),
+            Line::from("The managed keybind is stored in ~/.config/gtab/ghostty-shortcut.conf."),
+            Line::default(),
+            Line::from("Press c to toggle close_tab"),
+            Line::from("Press g to edit the Ghostty shortcut"),
+            Line::from("Reload Ghostty config or restart Ghostty after changing it"),
             Line::from("Enter or Esc to close"),
         ]))
         .block(Block::default().title("Settings").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
+    let area = centered_rect(62, 28, frame.area());
+    let current_input = if app.shortcut_input.is_empty() {
+        env.ghostty_shortcut_display()
+    } else {
+        app.shortcut_input.as_str()
+    };
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from("Set the Ghostty shortcut used to run `gtab`."),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("Shortcut: ", Style::default().fg(Color::Cyan)),
+                Span::raw(current_input),
+            ]),
+            Line::default(),
+            Line::from("Examples: cmd+g, cmd+shift+g, ctrl+alt+g"),
+            Line::from("This sends `gtab` plus Enter to the focused Ghostty shell."),
+            Line::default(),
+            Line::from("Enter to save, Esc to cancel"),
+        ]))
+        .block(
+            Block::default()
+                .title("Ghostty Shortcut")
+                .borders(Borders::ALL),
+        ),
         area,
     );
 }
@@ -795,4 +1030,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn shortcut_sync_message(sync: &GhosttyShortcutSync) -> String {
+    format!(
+        "Ghostty shortcut {} saved to {}. Reload Ghostty config or restart Ghostty.",
+        sync.shortcut,
+        sync.include_path.display()
+    )
 }

@@ -47,6 +47,7 @@ gtab edit <name>     Edit a workspace script
 gtab remove <name>   Remove a workspace
 gtab set             Show settings
 gtab set close_tab on|off
+gtab set ghostty_shortcut cmd+g
 ```
 
 ### Quick start
@@ -59,10 +60,12 @@ gtab set close_tab on|off
 
 ```text
 Enter   launch selected workspace
-s       save the current Ghostty window
+w/s     move through the workspace list
+a       save the current Ghostty window
 e       edit the selected workspace in $EDITOR
 d       delete the selected workspace
 t       open settings
+g       edit the Ghostty shortcut from Settings
 p       toggle the preview pane
 q       quit
 ```
@@ -80,7 +83,12 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 ```
 
 Each workspace is stored as a plain AppleScript file (`.applescript`) that you can inspect and edit freely with `gtab edit <name>`.
-The `config` file in the same directory currently supports `close_tab=true|false`.
+The `config` file in the same directory currently supports:
+
+- `close_tab=true|false`
+- `ghostty_shortcut=cmd+g`
+
+When you open the TUI or set `ghostty_shortcut`, gtab writes a managed Ghostty include at `~/.config/gtab/ghostty-shortcut.conf` and adds a `config-file` reference to your Ghostty config if needed. The shortcut sends `gtab` plus Enter to the focused Ghostty shell.
 
 ---
 

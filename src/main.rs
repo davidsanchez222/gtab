@@ -71,6 +71,16 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
             Ok(())
         }
         (Some("close_tab"), Some(_)) => bail!("close_tab value must be 'on' or 'off'"),
+        (Some("ghostty_shortcut"), Some(shortcut)) => {
+            let sync = env.set_ghostty_shortcut(shortcut)?;
+            println!("Set ghostty_shortcut = {}", env.ghostty_shortcut_display());
+            println!(
+                "Managed Ghostty keybind file: {}",
+                sync.include_path.display()
+            );
+            println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
+            Ok(())
+        }
         (Some(_), _) => bail!("unknown setting"),
         _ => bail!("usage: gtab set <key> <value>"),
     }
