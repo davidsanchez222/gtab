@@ -48,7 +48,7 @@ gtab remove <name>   Remove a workspace
 gtab shortcut        Show the recommended launcher for macOS shortcut tools
 gtab set             Show settings
 gtab set close_tab on|off
-gtab set ghostty_shortcut cmd+g
+gtab set ghostty_shortcut off|cmd+shift+g
 ```
 
 ### Quick start
@@ -89,11 +89,11 @@ Each workspace is stored as a plain AppleScript file (`.applescript`) that you c
 The `config` file in the same directory currently supports:
 
 - `close_tab=true|false`
-- `ghostty_shortcut=cmd+g`
+- `ghostty_shortcut=off|cmd+shift+g`
 
 gtab also manages a launcher script at `~/.config/gtab/launcher.sh`. This is the recommended target for macOS shortcut tools because it opens a new Ghostty window and runs `gtab` directly.
 
-When you open the TUI or set `ghostty_shortcut`, gtab writes a managed Ghostty include at `~/.config/gtab/ghostty-shortcut.conf` and adds a `config-file` reference to your Ghostty config if needed. That legacy shortcut sends `gtab` plus Enter to the focused Ghostty shell, so it can fail inside Claude Code, Codex, vim, or fzf.
+When you open the TUI or set `ghostty_shortcut`, gtab writes a managed Ghostty include at `~/.config/gtab/ghostty-shortcut.conf` and adds a `config-file` reference to your Ghostty config if needed. The recommended default is `off`, which disables the old text-injection shortcut so it does not conflict with launcher-based `Cmd+G`. If you set a real key combo there, that legacy shortcut sends `gtab` plus Enter to the focused Ghostty shell, so it can fail inside Claude Code, Codex, vim, or fzf.
 
 ---
 

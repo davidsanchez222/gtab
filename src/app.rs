@@ -998,6 +998,7 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
     let area = centered_rect(72, 58, frame.area());
     let close_tab = if env.config.close_tab { "on" } else { "off" };
     let launcher_path = env.launcher_path();
+    let legacy_disabled = env.ghostty_shortcut_display() == "off";
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
@@ -1029,9 +1030,19 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
-            Line::from("Legacy mode: runs `gtab` in the focused Ghostty shell."),
-            Line::from("This can fail in Claude Code, Codex, vim, or fzf."),
-            Line::from("The managed keybind is stored in ~/.config/gtab/ghostty-shortcut.conf."),
+            Line::from(if legacy_disabled {
+                "Legacy mode is disabled to avoid conflicting with launcher-based Cmd+G."
+            } else {
+                "Legacy mode: runs `gtab` in the focused Ghostty shell."
+            }),
+            Line::from(if legacy_disabled {
+                "Set ghostty_shortcut to a key combo if you still want the old behavior."
+            } else {
+                "This can fail in Claude Code, Codex, vim, or fzf."
+            }),
+            Line::from(
+                "The managed Ghostty include lives in ~/.config/gtab/ghostty-shortcut.conf.",
+            ),
             Line::default(),
             Line::from("Press c to toggle close_tab"),
             Line::from("Press g to edit the Ghostty shortcut"),
@@ -1065,7 +1076,7 @@ fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
                 Span::raw(current_input),
             ]),
             Line::default(),
-            Line::from("Examples: cmd+g, cmd+shift+g, ctrl+alt+g"),
+            Line::from("Examples: off, cmd+shift+g, ctrl+alt+g"),
             Line::from("This sends `gtab` plus Enter to the focused Ghostty shell."),
             Line::from("It can fail when Claude Code, Codex, vim, or fzf owns the terminal."),
             Line::default(),
@@ -1107,6 +1118,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn shortcut_sync_message(sync: &GhosttyShortcutSync) -> String {
+    if sync.shortcut == "off" {
+        return format!(
+            "Legacy Ghostty shortcut disabled in {}. Use `gtab shortcut` for launcher setup.",
+            sync.include_path.display()
+        );
+    }
+
     format!(
         "Legacy Ghostty shortcut {} saved to {}. Use `gtab shortcut` for Claude/Codex-safe launcher setup.",
         sync.shortcut,

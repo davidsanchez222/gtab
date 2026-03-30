@@ -83,9 +83,14 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
                 "Managed Ghostty keybind file: {}",
                 sync.include_path.display()
             );
-            println!("This legacy shortcut types `gtab` into the focused shell.");
-            println!("For Claude Code / Codex, use `gtab shortcut` instead.");
-            println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
+            if env.ghostty_shortcut_display() == "off" {
+                println!("Legacy Ghostty text-injection shortcut is now disabled.");
+                println!("Use `gtab shortcut` and bind that launcher to Cmd+G instead.");
+            } else {
+                println!("This legacy shortcut types `gtab` into the focused shell.");
+                println!("For Claude Code / Codex, use `gtab shortcut` instead.");
+                println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
+            }
             Ok(())
         }
         (Some(_), _) => bail!("unknown setting"),

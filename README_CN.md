@@ -48,7 +48,7 @@ gtab remove <name>   删除某个 workspace
 gtab shortcut        查看推荐的 macOS 快捷键 launcher
 gtab set             查看设置
 gtab set close_tab on|off
-gtab set ghostty_shortcut cmd+g
+gtab set ghostty_shortcut off|cmd+shift+g
 ```
 
 ### 快速上手
@@ -89,11 +89,11 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 同目录下的 `config` 文件目前支持：
 
 - `close_tab=true|false`
-- `ghostty_shortcut=cmd+g`
+- `ghostty_shortcut=off|cmd+shift+g`
 
 gtab 还会管理一个 launcher 脚本：`~/.config/gtab/launcher.sh`。这是推荐给 macOS 快捷键工具使用的入口，因为它会新开一个 Ghostty 窗口并直接运行 `gtab`。
 
-当你打开 TUI 或设置 `ghostty_shortcut` 时，gtab 会写入一个受管理的 Ghostty include 文件 `~/.config/gtab/ghostty-shortcut.conf`，并在需要时把 `config-file` 引用加到 Ghostty 配置中。这个旧方案的实现方式是向当前聚焦的 Ghostty shell 发送 `gtab` 加回车，所以在 Claude Code、Codex、vim 或 fzf 这类界面里可能失效。
+当你打开 TUI 或设置 `ghostty_shortcut` 时，gtab 会写入一个受管理的 Ghostty include 文件 `~/.config/gtab/ghostty-shortcut.conf`，并在需要时把 `config-file` 引用加到 Ghostty 配置中。推荐默认值是 `off`，这样旧的文本注入快捷键就不会再和 launcher 版 `Cmd+G` 冲突。如果你把它设置成实际按键组合，这个旧方案仍然会向当前聚焦的 Ghostty shell 发送 `gtab` 加回车，所以在 Claude Code、Codex、vim 或 fzf 这类界面里可能失效。
 
 ---
 

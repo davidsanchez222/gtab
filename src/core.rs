@@ -7,7 +7,7 @@ use std::{
 };
 
 const APPLE_EXT: &str = "applescript";
-const DEFAULT_GHOSTTY_SHORTCUT: &str = "cmd+g";
+const DEFAULT_GHOSTTY_SHORTCUT: &str = "off";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
 const LAUNCHER_SCRIPT_NAME: &str = "launcher.sh";
 
@@ -361,11 +361,19 @@ fn normalize_ghostty_shortcut(shortcut: &str) -> Result<String> {
         bail!("ghostty_shortcut cannot be empty");
     }
 
+    if is_ghostty_shortcut_disabled(&normalized) {
+        return Ok(DEFAULT_GHOSTTY_SHORTCUT.to_string());
+    }
+
     if normalized.contains('=') || normalized.contains('\n') || normalized.contains('\r') {
         bail!("ghostty_shortcut contains invalid characters");
     }
 
     Ok(normalized)
+}
+
+fn is_ghostty_shortcut_disabled(shortcut: &str) -> bool {
+    matches!(shortcut.trim(), "off" | "none" | "disabled")
 }
 
 fn capture_ghostty_tabs() -> Result<Vec<TabRow>> {
@@ -566,6 +574,10 @@ fn apple_escape(value: &str) -> String {
 }
 
 fn build_ghostty_shortcut_include(shortcut: &str) -> String {
+    if is_ghostty_shortcut_disabled(shortcut) {
+        return "# Managed by gtab. Update this in gtab settings.\n# Legacy Ghostty text-injection shortcut is disabled.\n".to_string();
+    }
+
     format!(
         "# Managed by gtab. Update this in gtab settings.\n# This sends `gtab` to the focused Ghostty shell.\nkeybind = {shortcut}=text:gtab\\x0d\n"
     )
@@ -722,8 +734,14 @@ pub fn format_workspace_list(workspaces: &[Workspace]) -> String {
 
 pub fn format_settings(env: &AppEnv) -> String {
     let close_tab = if env.config.close_tab { "on" } else { "off" };
+    let legacy_note = if is_ghostty_shortcut_disabled(&env.config.ghostty_shortcut) {
+        "Legacy Ghostty shortcut is disabled to avoid conflicting with launcher-based Cmd+G."
+    } else {
+        "Legacy Ghostty shortcut sends `gtab` to the focused shell and can fail in Claude Code/Codex."
+    };
+
     format!(
-        "Settings:\n  close_tab = {close_tab}\n  launcher = {}\n  ghostty_shortcut = {}\n  Recommended: bind `gtab shortcut` in Shortcuts, Raycast, or Hammerspoon.\n  Legacy Ghostty shortcut sends `gtab` to the focused shell and can fail in Claude Code/Codex.",
+        "Settings:\n  close_tab = {close_tab}\n  launcher = {}\n  ghostty_shortcut = {}\n  Recommended: bind `gtab shortcut` in Shortcuts, Raycast, or Hammerspoon.\n  {legacy_note}",
         env.launcher_path().display(),
         env.config.ghostty_shortcut
     )
@@ -751,6 +769,15 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert!(config.close_tab);
         assert_eq!(config.ghostty_shortcut, "cmd+shift+g");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_normalizes_disabled_ghostty_shortcut() {
+        let path = tempfile_path("config-off");
+        std::fs::write(&path, "ghostty_shortcut=disabled\n").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.ghostty_shortcut, "off");
         let _ = std::fs::remove_file(path);
     }
 
@@ -807,6 +834,13 @@ end tell
     fn ghostty_shortcut_include_writes_keybind_command() {
         let include = build_ghostty_shortcut_include("cmd+g");
         assert!(include.contains("keybind = cmd+g=text:gtab\\x0d"));
+    }
+
+    #[test]
+    fn disabled_ghostty_shortcut_include_has_no_keybind() {
+        let include = build_ghostty_shortcut_include("off");
+        assert!(!include.contains("keybind ="));
+        assert!(include.contains("shortcut is disabled"));
     }
 
     #[test]
