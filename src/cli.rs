@@ -35,4 +35,6 @@ pub enum Commands {
         key: Option<String>,
         value: Option<String>,
     },
+    /// Show the recommended launcher for macOS shortcut tools.
+    Shortcut,
 }

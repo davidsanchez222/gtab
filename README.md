@@ -45,6 +45,7 @@ gtab save <name>     Save current Ghostty window as a workspace
 gtab list            List all saved workspaces
 gtab edit <name>     Edit a workspace script
 gtab remove <name>   Remove a workspace
+gtab shortcut        Show the recommended launcher for macOS shortcut tools
 gtab set             Show settings
 gtab set close_tab on|off
 gtab set ghostty_shortcut cmd+g
@@ -55,6 +56,7 @@ gtab set ghostty_shortcut cmd+g
 1. Open Ghostty and set up your tabs.
 2. Run `gtab save myproject` to capture the layout.
 3. Run `gtab` to open the TUI and search, preview, or launch saved workspaces.
+4. Run `gtab shortcut` and bind the generated launcher in Shortcuts, Raycast, or Hammerspoon if you want a reliable `Cmd+G`.
 
 ### TUI shortcuts
 
@@ -89,7 +91,9 @@ The `config` file in the same directory currently supports:
 - `close_tab=true|false`
 - `ghostty_shortcut=cmd+g`
 
-When you open the TUI or set `ghostty_shortcut`, gtab writes a managed Ghostty include at `~/.config/gtab/ghostty-shortcut.conf` and adds a `config-file` reference to your Ghostty config if needed. The shortcut sends `gtab` plus Enter to the focused Ghostty shell.
+gtab also manages a launcher script at `~/.config/gtab/launcher.sh`. This is the recommended target for macOS shortcut tools because it opens a new Ghostty window and runs `gtab` directly.
+
+When you open the TUI or set `ghostty_shortcut`, gtab writes a managed Ghostty include at `~/.config/gtab/ghostty-shortcut.conf` and adds a `config-file` reference to your Ghostty config if needed. That legacy shortcut sends `gtab` plus Enter to the focused Ghostty shell, so it can fail inside Claude Code, Codex, vim, or fzf.
 
 ---
 

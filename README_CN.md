@@ -45,6 +45,7 @@ gtab save <name>     将当前 Ghostty 窗口保存为 workspace
 gtab list            列出所有已保存的 workspace
 gtab edit <name>     编辑某个 workspace 脚本
 gtab remove <name>   删除某个 workspace
+gtab shortcut        查看推荐的 macOS 快捷键 launcher
 gtab set             查看设置
 gtab set close_tab on|off
 gtab set ghostty_shortcut cmd+g
@@ -55,6 +56,7 @@ gtab set ghostty_shortcut cmd+g
 1. 在 Ghostty 中打开并布置好你的标签页。
 2. 运行 `gtab save myproject` 保存当前布局。
 3. 运行 `gtab` 打开 TUI，在其中搜索、预览或启动 workspace。
+4. 如果你想稳定地绑定 `Cmd+G`，运行 `gtab shortcut`，再把生成的 launcher 绑定到 Shortcuts、Raycast 或 Hammerspoon。
 
 ### TUI 快捷键
 
@@ -89,7 +91,9 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 - `close_tab=true|false`
 - `ghostty_shortcut=cmd+g`
 
-当你打开 TUI 或设置 `ghostty_shortcut` 时，gtab 会写入一个受管理的 Ghostty include 文件 `~/.config/gtab/ghostty-shortcut.conf`，并在需要时把 `config-file` 引用加到 Ghostty 配置中。这个快捷键的实现方式是向当前聚焦的 Ghostty shell 发送 `gtab` 加回车。
+gtab 还会管理一个 launcher 脚本：`~/.config/gtab/launcher.sh`。这是推荐给 macOS 快捷键工具使用的入口，因为它会新开一个 Ghostty 窗口并直接运行 `gtab`。
+
+当你打开 TUI 或设置 `ghostty_shortcut` 时，gtab 会写入一个受管理的 Ghostty include 文件 `~/.config/gtab/ghostty-shortcut.conf`，并在需要时把 `config-file` 引用加到 Ghostty 配置中。这个旧方案的实现方式是向当前聚焦的 Ghostty shell 发送 `gtab` 加回车，所以在 Claude Code、Codex、vim 或 fzf 这类界面里可能失效。
 
 ---
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     env, fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -8,6 +9,7 @@ use std::{
 const APPLE_EXT: &str = "applescript";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "cmd+g";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
+const LAUNCHER_SCRIPT_NAME: &str = "launcher.sh";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -64,6 +66,16 @@ impl AppEnv {
         self.config.ghostty_shortcut = normalize_ghostty_shortcut(shortcut)?;
         self.write_config()?;
         self.sync_ghostty_shortcut()
+    }
+
+    pub fn launcher_path(&self) -> PathBuf {
+        self.base_dir.join(LAUNCHER_SCRIPT_NAME)
+    }
+
+    pub fn ensure_launcher_script(&self) -> Result<PathBuf> {
+        let path = self.launcher_path();
+        self.write_launcher_script(&path)?;
+        Ok(path)
     }
 
     pub fn ensure_ghostty_shortcut(&self) -> Result<bool> {
@@ -212,6 +224,34 @@ impl AppEnv {
 
         fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(true)
+    }
+
+    fn write_launcher_script(&self, path: &Path) -> Result<bool> {
+        let content = build_launcher_script();
+        let mut changed = false;
+
+        if fs::read_to_string(path).ok().as_deref() != Some(content.as_str()) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+
+            fs::write(path, content)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            changed = true;
+        }
+
+        let metadata =
+            fs::metadata(path).with_context(|| format!("failed to read {}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o777 != 0o755 {
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)
+                .with_context(|| format!("failed to chmod {}", path.display()))?;
+            changed = true;
+        }
+
+        Ok(changed)
     }
 
     fn write_config(&mut self) -> Result<()> {
@@ -531,6 +571,26 @@ fn build_ghostty_shortcut_include(shortcut: &str) -> String {
     )
 }
 
+fn build_launcher_script() -> String {
+    r#"#!/bin/sh
+set -eu
+
+GTAB_BIN="$(command -v gtab 2>/dev/null || true)"
+
+if [ -z "$GTAB_BIN" ] && [ -x "/opt/homebrew/bin/gtab" ]; then
+  GTAB_BIN="/opt/homebrew/bin/gtab"
+fi
+
+if [ -z "$GTAB_BIN" ] || [ ! -x "$GTAB_BIN" ]; then
+  echo "gtab binary not found. Install gtab or add it to PATH." >&2
+  exit 1
+fi
+
+exec open -na Ghostty.app --args -e "$GTAB_BIN"
+"#
+    .to_string()
+}
+
 fn ensure_ghostty_include_reference(config_path: &Path, include_path: &Path) -> Result<bool> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)
@@ -660,19 +720,28 @@ pub fn format_workspace_list(workspaces: &[Workspace]) -> String {
     lines.join("\n")
 }
 
-pub fn format_settings(config: &Config) -> String {
-    let close_tab = if config.close_tab { "on" } else { "off" };
+pub fn format_settings(env: &AppEnv) -> String {
+    let close_tab = if env.config.close_tab { "on" } else { "off" };
     format!(
-        "Settings:\n  close_tab = {close_tab}\n  ghostty_shortcut = {}\n  (Ghostty shortcut sends `gtab` to the focused shell)",
-        config.ghostty_shortcut
+        "Settings:\n  close_tab = {close_tab}\n  launcher = {}\n  ghostty_shortcut = {}\n  Recommended: bind `gtab shortcut` in Shortcuts, Raycast, or Hammerspoon.\n  Legacy Ghostty shortcut sends `gtab` to the focused shell and can fail in Claude Code/Codex.",
+        env.launcher_path().display(),
+        env.config.ghostty_shortcut
+    )
+}
+
+pub fn format_shortcut_guide(env: &AppEnv, launcher_path: &Path) -> String {
+    format!(
+        "Shortcut launcher:\n  {}\n\nBind Cmd+G in macOS Shortcuts, Raycast, or Hammerspoon to run this script.\nIt opens a new Ghostty window and runs gtab without typing into the current shell.\n\nLegacy Ghostty keybind:\n  {}\n  This sends `gtab` to the focused shell and can fail in Claude Code, Codex, vim, or fzf.",
+        launcher_path.display(),
+        env.ghostty_shortcut_display()
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, TabRow, apple_escape, build_ghostty_shortcut_include, build_workspace_script,
-        parse_workspace_tabs,
+        Config, TabRow, apple_escape, build_ghostty_shortcut_include, build_launcher_script,
+        build_workspace_script, parse_workspace_tabs,
     };
 
     #[test]
@@ -738,6 +807,14 @@ end tell
     fn ghostty_shortcut_include_writes_keybind_command() {
         let include = build_ghostty_shortcut_include("cmd+g");
         assert!(include.contains("keybind = cmd+g=text:gtab\\x0d"));
+    }
+
+    #[test]
+    fn launcher_script_prefers_path_and_homebrew_fallback() {
+        let script = build_launcher_script();
+        assert!(script.contains("command -v gtab"));
+        assert!(script.contains("/opt/homebrew/bin/gtab"));
+        assert!(script.contains("open -na Ghostty.app --args -e \"$GTAB_BIN\""));
     }
 
     fn tempfile_path(name: &str) -> std::path::PathBuf {

@@ -27,16 +27,14 @@ const DOUBLE_CLICK_MS: u64 = 350;
 
 pub fn run_tui(env: &mut AppEnv) -> Result<()> {
     let mut terminal = TerminalSession::start()?;
+    let launcher_status = env.ensure_launcher_script();
     let sync_status = env.ensure_ghostty_shortcut();
     let mut app = App::new(env.list_workspaces()?);
 
-    match sync_status {
-        Ok(true) => app.set_info(format!(
-            "Ghostty shortcut {} synced. Reload Ghostty config or restart Ghostty.",
-            env.ghostty_shortcut_display()
-        )),
-        Ok(false) => {}
-        Err(error) => app.set_error(format!("Ghostty shortcut sync failed: {error}")),
+    if let Err(error) = launcher_status {
+        app.set_error(format!("Launcher setup failed: {error}"));
+    } else if let Err(error) = sync_status {
+        app.set_error(format!("Legacy Ghostty shortcut sync failed: {error}"));
     }
 
     loop {
@@ -997,8 +995,9 @@ fn draw_delete_dialog(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
-    let area = centered_rect(62, 32, frame.area());
+    let area = centered_rect(72, 58, frame.area());
     let close_tab = if env.config.close_tab { "on" } else { "off" };
+    let launcher_path = env.launcher_path();
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
@@ -1012,6 +1011,17 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
             Line::from("Close the current tab after launching a workspace."),
             Line::default(),
             Line::from(vec![
+                Span::styled("launcher", Style::default().fg(Color::Cyan)),
+                Span::raw(" = "),
+                Span::styled(
+                    launcher_path.display().to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+            Line::from("Recommended: bind this script in Shortcuts, Raycast, or Hammerspoon."),
+            Line::from("It opens a new Ghostty window and runs `gtab`."),
+            Line::default(),
+            Line::from(vec![
                 Span::styled("ghostty_shortcut", Style::default().fg(Color::Cyan)),
                 Span::raw(" = "),
                 Span::styled(
@@ -1019,12 +1029,16 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
                     Style::default().fg(Color::Yellow),
                 ),
             ]),
-            Line::from("Runs `gtab` in the focused Ghostty shell."),
+            Line::from("Legacy mode: runs `gtab` in the focused Ghostty shell."),
+            Line::from("This can fail in Claude Code, Codex, vim, or fzf."),
             Line::from("The managed keybind is stored in ~/.config/gtab/ghostty-shortcut.conf."),
             Line::default(),
             Line::from("Press c to toggle close_tab"),
             Line::from("Press g to edit the Ghostty shortcut"),
-            Line::from("Reload Ghostty config or restart Ghostty after changing it"),
+            Line::from("Run `gtab shortcut` for launcher binding instructions"),
+            Line::from(
+                "Reload Ghostty config or restart Ghostty after changing the legacy shortcut",
+            ),
             Line::from("Enter or Esc to close"),
         ]))
         .block(Block::default().title("Settings").borders(Borders::ALL)),
@@ -1033,17 +1047,18 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, env: &AppEnv) {
 }
 
 fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
-    let area = centered_rect(62, 28, frame.area());
+    let area = centered_rect(70, 46, frame.area());
     let current_input = if app.shortcut_input.is_empty() {
         env.ghostty_shortcut_display()
     } else {
         app.shortcut_input.as_str()
     };
+    let launcher_path = env.launcher_path();
 
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(Text::from(vec![
-            Line::from("Set the Ghostty shortcut used to run `gtab`."),
+            Line::from("Set the legacy Ghostty shortcut used to run `gtab`."),
             Line::default(),
             Line::from(vec![
                 Span::styled("Shortcut: ", Style::default().fg(Color::Cyan)),
@@ -1052,6 +1067,13 @@ fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv) {
             Line::default(),
             Line::from("Examples: cmd+g, cmd+shift+g, ctrl+alt+g"),
             Line::from("This sends `gtab` plus Enter to the focused Ghostty shell."),
+            Line::from("It can fail when Claude Code, Codex, vim, or fzf owns the terminal."),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("Launcher: ", Style::default().fg(Color::Cyan)),
+                Span::raw(launcher_path.display().to_string()),
+            ]),
+            Line::from("Recommended: bind the launcher in Shortcuts, Raycast, or Hammerspoon."),
             Line::default(),
             Line::from("Enter to save, Esc to cancel"),
         ]))
@@ -1086,7 +1108,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn shortcut_sync_message(sync: &GhosttyShortcutSync) -> String {
     format!(
-        "Ghostty shortcut {} saved to {}. Reload Ghostty config or restart Ghostty.",
+        "Legacy Ghostty shortcut {} saved to {}. Use `gtab shortcut` for Claude/Codex-safe launcher setup.",
         sync.shortcut,
         sync.include_path.display()
     )

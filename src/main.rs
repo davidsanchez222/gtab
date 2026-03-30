@@ -5,7 +5,7 @@ mod core;
 use anyhow::{Result, bail};
 use clap::Parser;
 use cli::{Cli, Commands};
-use core::{AppEnv, format_settings, format_workspace_list};
+use core::{AppEnv, format_settings, format_shortcut_guide, format_workspace_list};
 
 fn main() {
     if let Err(error) = run() {
@@ -50,6 +50,11 @@ fn run() -> Result<()> {
         (Some(Commands::Set { key, value }), None) => {
             handle_set(&mut env, key.as_deref(), value.as_deref())
         }
+        (Some(Commands::Shortcut), None) => {
+            let launcher_path = env.ensure_launcher_script()?;
+            println!("{}", format_shortcut_guide(&env, &launcher_path));
+            Ok(())
+        }
         _ => bail!("unexpected CLI arguments"),
     }
 }
@@ -57,7 +62,7 @@ fn run() -> Result<()> {
 fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Result<()> {
     match (key, value) {
         (None, None) => {
-            println!("{}", format_settings(&env.config));
+            println!("{}", format_settings(env));
             Ok(())
         }
         (Some("close_tab"), Some("on" | "true")) => {
@@ -78,6 +83,8 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
                 "Managed Ghostty keybind file: {}",
                 sync.include_path.display()
             );
+            println!("This legacy shortcut types `gtab` into the focused shell.");
+            println!("For Claude Code / Codex, use `gtab shortcut` instead.");
             println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
             Ok(())
         }
