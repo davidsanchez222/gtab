@@ -1,9 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
-use gtab::core::{AppEnv, parse_global_hotkey};
+use gtab::core::{AppEnv, launch_gtab_in_ghostty, parse_global_hotkey};
 use std::{
     ffi::c_void,
     path::{Path, PathBuf},
-    process::Command,
     ptr,
     sync::OnceLock,
 };
@@ -125,10 +124,10 @@ extern "C" fn on_hotkey_pressed(
     _event: EventRef,
     _user_data: *mut c_void,
 ) -> OSStatus {
-    if let Some(path) = GTAB_BIN.get() {
-        if let Err(error) = launch_gtab(path) {
-            eprintln!("error: {error}");
-        }
+    if let Some(path) = GTAB_BIN.get()
+        && let Err(error) = launch_gtab(path)
+    {
+        eprintln!("error: {error}");
     }
 
     0
@@ -149,17 +148,7 @@ fn resolve_gtab_binary() -> Result<PathBuf> {
 }
 
 fn launch_gtab(path: &Path) -> Result<()> {
-    let status = Command::new("open")
-        .args(["-na", "Ghostty.app", "--args", "-e"])
-        .arg(path)
-        .status()
-        .with_context(|| format!("failed to launch {}", path.display()))?;
-
-    if !status.success() {
-        bail!("open exited with status {status}");
-    }
-
-    Ok(())
+    launch_gtab_in_ghostty(path)
 }
 
 fn check_status(status: OSStatus, context: &str) -> Result<()> {

@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, c_void};
 use std::{
     env, fs,
     os::unix::fs::PermissionsExt,
@@ -11,9 +13,52 @@ const DEFAULT_GLOBAL_SHORTCUT: &str = "cmd+g";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "off";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
 const LAUNCHER_SCRIPT_NAME: &str = "launcher.sh";
+const LAUNCHER_AUTO_CLOSE_ENV_VAR: &str = "GTAB_AUTO_CLOSE_LAUNCHER";
 const HOTKEY_SERVICE_LABEL: &str = "com.franvy.gtab.hotkey";
 const HOTKEY_PLIST_NAME: &str = "com.franvy.gtab.hotkey.plist";
 const HOTKEY_LOG_NAME: &str = "gtab-hotkey.log";
+#[cfg(target_os = "macos")]
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+#[cfg(target_os = "macos")]
+type Boolean = u8;
+#[cfg(target_os = "macos")]
+type CFIndex = isize;
+#[cfg(target_os = "macos")]
+type CFStringEncoding = u32;
+#[cfg(target_os = "macos")]
+type CFTypeRef = *const c_void;
+#[cfg(target_os = "macos")]
+type CFStringRef = *const c_void;
+#[cfg(target_os = "macos")]
+type TISInputSourceRef = *const c_void;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
+    fn TISCopyCurrentASCIICapableKeyboardInputSource() -> TISInputSourceRef;
+    fn TISGetInputSourceProperty(
+        input_source: TISInputSourceRef,
+        property_key: CFStringRef,
+    ) -> CFTypeRef;
+    fn TISSelectInputSource(input_source: TISInputSourceRef) -> i32;
+    static kTISPropertyInputSourceID: CFStringRef;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(value: CFTypeRef);
+    fn CFStringGetLength(value: CFStringRef) -> CFIndex;
+    fn CFStringGetMaximumSizeForEncoding(length: CFIndex, encoding: CFStringEncoding) -> CFIndex;
+    fn CFStringGetCString(
+        value: CFStringRef,
+        buffer: *mut i8,
+        buffer_size: CFIndex,
+        encoding: CFStringEncoding,
+    ) -> Boolean;
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -23,9 +68,34 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug)]
+pub struct WorkspaceTab {
+    pub title: String,
+    pub working_dir: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Workspace {
     pub name: String,
-    pub tabs: Vec<String>,
+    pub path: PathBuf,
+    pub tabs: Vec<WorkspaceTab>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GhosttyLauncherTarget {
+    pub window_id: String,
+    pub tab_id: String,
+}
+
+#[derive(Debug)]
+pub struct ShortcutLauncherInputSourceGuard {
+    #[cfg(target_os = "macos")]
+    previous_source: Option<MacInputSource>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacInputSource {
+    raw: TISInputSourceRef,
 }
 
 #[derive(Debug)]
@@ -118,6 +188,7 @@ impl AppEnv {
 
             workspaces.push(Workspace {
                 name: stem.to_string(),
+                path,
                 tabs,
             });
         }
@@ -239,13 +310,7 @@ impl AppEnv {
     }
 
     pub fn restart_hotkey_agent(&self) -> Result<HotkeyAgentStatus> {
-        self.write_hotkey_plist(&self.hotkey_plist_path()?)?;
-        if !self.launchctl_print().success() {
-            return self.install_hotkey_agent();
-        }
-
-        self.kickstart_hotkey_agent()?;
-        self.hotkey_agent_status()
+        self.install_hotkey_agent()
     }
 
     pub fn uninstall_hotkey_agent(&self) -> Result<()> {
@@ -447,6 +512,160 @@ impl AppEnv {
     }
 }
 
+impl ShortcutLauncherInputSourceGuard {
+    pub fn activate_for_shortcut_launcher() -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let current = MacInputSource::current_keyboard()
+                .context("failed to resolve the current macOS input source")?;
+            let ascii = MacInputSource::current_ascii_capable()
+                .context("failed to resolve an ASCII-capable macOS input source")?;
+
+            let should_switch = should_switch_to_ascii_input_source(
+                current.id().ok().as_deref(),
+                ascii.id().ok().as_deref(),
+                current.ptr_eq(&ascii),
+            );
+
+            if !should_switch {
+                return Ok(Self {
+                    previous_source: None,
+                });
+            }
+
+            ascii
+                .select()
+                .context("failed to switch gtab to an ASCII-capable input source")?;
+
+            Ok(Self {
+                previous_source: Some(current),
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(previous_source) = self.previous_source.take() else {
+                return Ok(());
+            };
+
+            previous_source
+                .select()
+                .context("failed to restore the previous macOS input source")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for ShortcutLauncherInputSourceGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("warning: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MacInputSource {
+    fn current_keyboard() -> Result<Self> {
+        let raw = unsafe { TISCopyCurrentKeyboardInputSource() };
+        Self::new(raw, "current keyboard input source was unavailable")
+    }
+
+    fn current_ascii_capable() -> Result<Self> {
+        let raw = unsafe { TISCopyCurrentASCIICapableKeyboardInputSource() };
+        Self::new(raw, "ASCII-capable keyboard input source was unavailable")
+    }
+
+    fn new(raw: TISInputSourceRef, context: &str) -> Result<Self> {
+        if raw.is_null() {
+            bail!("{context}");
+        }
+
+        Ok(Self { raw })
+    }
+
+    fn id(&self) -> Result<String> {
+        let raw = unsafe { TISGetInputSourceProperty(self.raw, kTISPropertyInputSourceID) };
+        cf_string_to_string(raw as CFStringRef)
+            .context("failed to read the input source identifier")
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+
+    fn select(&self) -> Result<()> {
+        let status = unsafe { TISSelectInputSource(self.raw) };
+        if status == 0 {
+            return Ok(());
+        }
+
+        bail!("macOS returned OSStatus {status} while selecting an input source")
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacInputSource {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { CFRelease(self.raw) };
+        }
+    }
+}
+
+fn should_switch_to_ascii_input_source(
+    current_id: Option<&str>,
+    ascii_id: Option<&str>,
+    same_source: bool,
+) -> bool {
+    if same_source {
+        return false;
+    }
+
+    match (current_id, ascii_id) {
+        (Some(current_id), Some(ascii_id)) => current_id != ascii_id,
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cf_string_to_string(value: CFStringRef) -> Result<String> {
+    if value.is_null() {
+        bail!("CFString value was null");
+    }
+
+    let length = unsafe { CFStringGetLength(value) };
+    let buffer_size =
+        unsafe { CFStringGetMaximumSizeForEncoding(length, K_CF_STRING_ENCODING_UTF8) };
+    if buffer_size < 0 {
+        bail!("failed to size the UTF-8 input source buffer");
+    }
+
+    let mut buffer = vec![0_i8; buffer_size as usize + 1];
+    let ok = unsafe {
+        CFStringGetCString(
+            value,
+            buffer.as_mut_ptr(),
+            buffer.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+        )
+    };
+    if ok == 0 {
+        bail!("failed to decode the input source identifier as UTF-8");
+    }
+
+    let string = unsafe { CStr::from_ptr(buffer.as_ptr()) };
+    Ok(string.to_string_lossy().into_owned())
+}
+
 pub fn hotkey_service_label() -> &'static str {
     HOTKEY_SERVICE_LABEL
 }
@@ -641,19 +860,40 @@ fn key_code_for_shortcut(key: &str) -> Option<u32> {
         "4" => 0x15,
         "6" => 0x16,
         "5" => 0x17,
+        "=" => 0x18,
         "9" => 0x19,
         "7" => 0x1A,
+        "-" => 0x1B,
         "8" => 0x1C,
         "0" => 0x1D,
+        "]" => 0x1E,
         "o" => 0x1F,
         "u" => 0x20,
+        "[" => 0x21,
         "i" => 0x22,
         "p" => 0x23,
+        "enter" | "return" => 0x24,
         "l" => 0x25,
         "j" => 0x26,
+        "'" => 0x27,
         "k" => 0x28,
+        ";" => 0x29,
+        "\\" => 0x2A,
+        "," => 0x2B,
+        "/" => 0x2C,
         "n" => 0x2D,
         "m" => 0x2E,
+        "." => 0x2F,
+        "tab" => 0x30,
+        "space" => 0x31,
+        "`" => 0x32,
+        "backspace" => 0x33,
+        "esc" | "escape" => 0x35,
+        "delete" => 0x75,
+        "left" => 0x7B,
+        "right" => 0x7C,
+        "down" => 0x7D,
+        "up" => 0x7E,
         _ => return None,
     })
 }
@@ -746,7 +986,7 @@ fn build_workspace_script(rows: &[TabRow]) -> String {
     out
 }
 
-fn parse_workspace_tabs(script: &str) -> Vec<String> {
+fn parse_workspace_tabs(script: &str) -> Vec<WorkspaceTab> {
     let mut tabs: Vec<ParsedWorkspaceTab> = Vec::new();
 
     for line in script.lines() {
@@ -768,12 +1008,15 @@ fn parse_workspace_tabs(script: &str) -> Vec<String> {
 
     tabs.into_iter()
         .enumerate()
-        .map(
-            |(index, tab)| match tab.title.filter(|title| !title.is_empty()) {
+        .map(|(index, tab)| WorkspaceTab {
+            title: match tab.title.filter(|title| !title.is_empty()) {
                 Some(title) => title,
                 None => fallback_tab_name(index + 1, tab.working_dir.as_deref()),
             },
-        )
+            working_dir: tab
+                .working_dir
+                .filter(|working_dir| !working_dir.is_empty()),
+        })
         .collect()
 }
 
@@ -880,7 +1123,19 @@ if [ -z "$GTAB_BIN" ] || [ ! -x "$GTAB_BIN" ]; then
   exit 1
 fi
 
-exec open -na Ghostty.app --args -e "$GTAB_BIN"
+exec osascript - "$GTAB_BIN" <<'APPLESCRIPT'
+on run argv
+  set gtabPath to item 1 of argv
+  tell application "Ghostty"
+    activate
+    set cfg to new surface configuration
+    set command of cfg to gtabPath
+    set environment variables of cfg to {"GTAB_AUTO_CLOSE_LAUNCHER=1"}
+    set wait after command of cfg to false
+    new window with configuration cfg
+  end tell
+end run
+APPLESCRIPT
 "#
     .to_string()
 }
@@ -1094,10 +1349,94 @@ pub fn format_settings(env: &AppEnv) -> String {
 
 pub fn format_shortcut_guide(env: &AppEnv, launcher_path: &Path) -> String {
     format!(
-        "Shortcut launcher:\n  {}\n\nBind Cmd+G in macOS Shortcuts, Raycast, or Hammerspoon to run this script.\nIt opens a new Ghostty window and runs gtab without typing into the current shell.\n\nLegacy Ghostty keybind:\n  {}\n  This sends `gtab` to the focused shell and can fail in Claude Code, Codex, vim, or fzf.",
+        "Shortcut launcher:\n  {}\n\nBind Cmd+G in macOS Shortcuts, Raycast, or Hammerspoon to run this script.\nIt opens a new Ghostty window in the existing app instance and runs gtab without typing into the current shell.\n\nLegacy Ghostty keybind:\n  {}\n  This sends `gtab` to the focused shell and can fail in Claude Code, Codex, vim, or fzf.",
         launcher_path.display(),
         env.ghostty_shortcut_display()
     )
+}
+
+pub fn launch_gtab_in_ghostty(path: &Path) -> Result<()> {
+    let script = format!(
+        r#"set gtabPath to "{}"
+tell application "Ghostty"
+  activate
+  set cfg to new surface configuration
+  set command of cfg to gtabPath
+  set environment variables of cfg to {{"{LAUNCHER_AUTO_CLOSE_ENV_VAR}=1"}}
+  set wait after command of cfg to false
+  new window with configuration cfg
+end tell"#,
+        apple_escape(&path.display().to_string())
+    );
+
+    run_osascript(&script)
+        .with_context(|| format!("failed to launch {} in Ghostty", path.display()))?;
+    Ok(())
+}
+
+pub fn launched_from_shortcut_launcher() -> bool {
+    matches!(
+        env::var(LAUNCHER_AUTO_CLOSE_ENV_VAR).as_deref(),
+        Ok("1" | "true" | "on")
+    )
+}
+
+pub fn current_ghostty_launcher_target() -> Result<Option<GhosttyLauncherTarget>> {
+    let output = run_osascript(
+        r#"tell application "Ghostty"
+  if (count of windows) is 0 then
+    return ""
+  end if
+  set win to front window
+  if selected tab of win is missing value then
+    return ""
+  end if
+  return ((id of win) as text) & linefeed & ((id of selected tab of win) as text)
+end tell"#,
+    )
+    .context("failed to resolve the current Ghostty launcher target")?;
+
+    let mut lines = output.lines();
+    let Some(window_id) = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(tab_id) = lines
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(GhosttyLauncherTarget {
+        window_id: window_id.to_string(),
+        tab_id: tab_id.to_string(),
+    }))
+}
+
+pub fn close_ghostty_launcher_tab_later(target: &GhosttyLauncherTarget) -> Result<()> {
+    let script = format!(
+        r#"delay 0.15
+tell application "Ghostty"
+  set winId to "{}"
+  set tabId to "{}"
+  if (count of (every window whose id is winId)) is greater than 0 then
+    set win to first window whose id is winId
+    if (count of (every tab of win whose id is tabId)) is greater than 0 then
+      close tab (first tab of win whose id is tabId)
+    end if
+  end if
+end tell"#,
+        apple_escape(&target.window_id),
+        apple_escape(&target.tab_id)
+    );
+
+    run_osascript(&script).context("failed to close the launcher Ghostty tab")?;
+    Ok(())
 }
 
 pub fn format_hotkey_status(status: &HotkeyAgentStatus, legacy_shortcut: &str) -> String {
@@ -1145,7 +1484,7 @@ mod tests {
     use super::{
         Config, HOTKEY_SERVICE_LABEL, TabRow, apple_escape, build_ghostty_shortcut_include,
         build_hotkey_launch_agent_plist, build_launcher_script, build_workspace_script,
-        parse_workspace_tabs,
+        parse_global_hotkey, parse_workspace_tabs, should_switch_to_ascii_input_source,
     };
 
     #[test]
@@ -1177,6 +1516,41 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.global_shortcut, "cmd+g");
         assert_eq!(config.ghostty_shortcut, "off");
+    }
+
+    #[test]
+    fn global_shortcut_supports_shifted_symbol_keys() {
+        assert!(parse_global_hotkey("cmd+shift+/").unwrap().is_some());
+        assert!(parse_global_hotkey("cmd+=").unwrap().is_some());
+    }
+
+    #[test]
+    fn global_shortcut_supports_named_navigation_keys() {
+        assert!(parse_global_hotkey("cmd+left").unwrap().is_some());
+        assert!(parse_global_hotkey("cmd+tab").unwrap().is_some());
+    }
+
+    #[test]
+    fn ascii_input_source_switch_skips_matching_source_ids() {
+        assert!(!should_switch_to_ascii_input_source(
+            Some("com.apple.keylayout.ABC"),
+            Some("com.apple.keylayout.ABC"),
+            false,
+        ));
+    }
+
+    #[test]
+    fn ascii_input_source_switch_skips_matching_source_refs() {
+        assert!(!should_switch_to_ascii_input_source(None, None, true));
+    }
+
+    #[test]
+    fn ascii_input_source_switch_uses_ascii_source_when_current_differs() {
+        assert!(should_switch_to_ascii_input_source(
+            Some("com.apple.inputmethod.SCIM.ITABC"),
+            Some("com.apple.keylayout.ABC"),
+            false,
+        ));
     }
 
     #[test]
@@ -1225,7 +1599,11 @@ end tell
 "#,
         );
 
-        assert_eq!(tabs, vec!["api".to_string(), "work".to_string()]);
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].title, "api");
+        assert_eq!(tabs[0].working_dir.as_deref(), Some("/tmp/project"));
+        assert_eq!(tabs[1].title, "work");
+        assert_eq!(tabs[1].working_dir.as_deref(), Some("/tmp/work"));
     }
 
     #[test]
@@ -1246,7 +1624,15 @@ end tell
         let script = build_launcher_script();
         assert!(script.contains("command -v gtab"));
         assert!(script.contains("/opt/homebrew/bin/gtab"));
-        assert!(script.contains("open -na Ghostty.app --args -e \"$GTAB_BIN\""));
+        assert!(script.contains("osascript - \"$GTAB_BIN\""));
+        assert!(script.contains("new window with configuration cfg"));
+        assert!(script.contains("set command of cfg to gtabPath"));
+        assert!(
+            script.contains("set environment variables of cfg to {\"GTAB_AUTO_CLOSE_LAUNCHER=1\"}")
+        );
+        assert!(script.contains("set wait after command of cfg to false"));
+        assert!(!script.contains("open -na Ghostty.app --args -e"));
+        assert!(!script.contains("shell:exec"));
     }
 
     #[test]

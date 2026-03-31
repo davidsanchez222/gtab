@@ -2,7 +2,7 @@
 
 **English** | [中文](README_CN.md)
 
-A Rust-powered Ghostty workspace manager with a keyboard-first TUI and compatible CLI commands. Save the current terminal layout as a workspace, search and preview saved workspaces, then relaunch them with one key or one command.
+A Rust-powered Ghostty workspace manager with a keyboard-first TUI and compatible CLI commands. Save the current terminal layout as a workspace, search saved workspaces, inspect their saved tabs in a dialog-style TUI, then relaunch them with one key or one command.
 
 ![gtab demo](Gtab.gif)
 
@@ -57,7 +57,7 @@ gtab set ghostty_shortcut off|cmd+shift+g
 
 1. Open Ghostty and set up your tabs.
 2. Run `gtab save myproject` to capture the layout.
-3. Run `gtab` to open the TUI and search, preview, or launch saved workspaces.
+3. Run `gtab` to open the TUI and search, inspect, or launch saved workspaces.
 4. After `brew install gtab`, the built-in hotkey helper should register `Cmd+G` automatically.
 5. If `Cmd+G` is not opening gtab, run `gtab hotkey doctor`.
 
@@ -65,16 +65,24 @@ gtab set ghostty_shortcut off|cmd+shift+g
 
 ```text
 Enter   launch selected workspace
-mouse   click to select, double-click to launch
-w/s     move through the workspace list
+/       start live search
+j/k     move through the workspace list
+↑/↓     move through the workspace list
+PgUp/Dn jump by a screen
+Home    jump to the top
+End/G   jump to the bottom
 a       save the current Ghostty window
 e       edit the selected workspace in $EDITOR
 d       delete the selected workspace
+g       edit the global shortcut from the quick settings pane
+r       reload the workspace list
 t       open settings
-g       edit the global Cmd+G shortcut from Settings
-p       toggle the preview pane
+?       open help
+mouse   click to select, double-click to launch, click shortcut to edit
 q       quit
 ```
+
+The TUI keeps a stable dialog layout: the left pane shows bracketed workspace labels, the middle pane shows the selected workspace's tabs as horizontal labels in saved order, and the right pane exposes the global shortcut and helper status.
 
 ---
 
@@ -96,6 +104,8 @@ The `config` file in the same directory currently supports:
 - `ghostty_shortcut=off|cmd+shift+g`
 
 gtab also installs a user LaunchAgent and a companion helper binary (`gtab-hotkey`) to register a global macOS shortcut. The default `global_shortcut` is `cmd+g`.
+
+When gtab is opened through the built-in global shortcut, it temporarily switches macOS to the most recently used ASCII-capable input source so single-key actions like `q`, `g`, and `t` keep working. The previous input source is restored when you leave the TUI or launch a workspace.
 
 The old Ghostty text-injection shortcut is still available through `ghostty_shortcut`, but it is legacy-only. Keep it set to `off` unless you are debugging, because it just sends `gtab` plus Enter to the focused shell and can fail inside Claude Code, Codex, vim, or fzf.
 
