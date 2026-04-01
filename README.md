@@ -6,6 +6,8 @@ A Rust-powered Ghostty workspace manager with a keyboard-first TUI and compatibl
 
 "If you live in tmux, you don't need this. If you prefer Ghostty's native tabs and macOS look, this is for you."
 
+"If you live in tmux, you don't need this. If you prefer Ghostty's native tabs and macOS look, this is for you."
+
 ![gtab demo](Gtab.gif)
 
 ---
