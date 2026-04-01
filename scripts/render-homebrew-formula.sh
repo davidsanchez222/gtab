@@ -43,8 +43,16 @@ class Gtab < Formula
     system "cargo", "install", *std_cargo_args
   end
 
-  def post_install
-    system bin/"gtab", "hotkey", "install"
+  def caveats
+    <<~EOS
+      Run this once to enable the built-in global hotkey helper:
+        gtab hotkey install
+
+      Workspaces are stored in ~/.config/gtab/ by default.
+      Override with: export GTAB_DIR="/your/path"
+
+      Requires Ghostty terminal: https://ghostty.org
+    EOS
   end
 
   test do

@@ -59,7 +59,7 @@ gtab set ghostty_shortcut off|cmd+shift+g
 1. 在 Ghostty 中打开并布置好你的标签页。
 2. 运行 `gtab save myproject` 保存当前布局。
 3. 运行 `gtab` 打开 TUI，在其中搜索、查看或启动 workspace。
-4. `brew install gtab` 之后，内建的热键 helper 会负责默认的 `Cmd+G`。
+4. `brew install gtab` 之后，再运行一次 `gtab hotkey install` 来注册默认的 `Cmd+G`。
 5. 如果 `Cmd+G` 没有打开 gtab，运行 `gtab hotkey doctor`。
 
 ### TUI 快捷键
@@ -105,7 +105,7 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 - `global_shortcut=cmd+g`
 - `ghostty_shortcut=off|cmd+shift+g`
 
-gtab 还会安装一个用户级 LaunchAgent 和配套 helper 二进制 `gtab-hotkey`，用于注册 macOS 全局快捷键。默认的 `global_shortcut` 是 `cmd+g`。
+运行 `gtab hotkey install` 后，gtab 会安装一个用户级 LaunchAgent 和配套 helper 二进制 `gtab-hotkey`，用于注册 macOS 全局快捷键。默认的 `global_shortcut` 是 `cmd+g`。
 
 当 gtab 打开 TUI 时，它会临时切换到最近使用过的 ASCII 输入源，这样 `q`、`g`、`s`、`t` 这类单键操作不会被中文输入法拦住；退出 TUI 或启动 workspace 之后，会再恢复到之前的输入法。
 新的 `launch_mode` 设置决定全局快捷键如何打开 gtab。默认的 `smart` 会优先复用当前 Ghostty prompt，只有在当前 tab 看起来不适合注入时才回退到独立 Ghostty 窗口；`window` 永远使用独立 launcher 窗口；`inject` 则会在 Ghostty 聚焦时始终把 gtab 输入到当前终端里。

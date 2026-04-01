@@ -61,7 +61,7 @@ gtab set ghostty_shortcut off|cmd+shift+g
 1. Open Ghostty and set up your tabs.
 2. Run `gtab save myproject` to capture the layout.
 3. Run `gtab` to open the TUI and search, inspect, or launch saved workspaces.
-4. After `brew install gtab`, the built-in hotkey helper should register `Cmd+G` automatically.
+4. After `brew install gtab`, run `gtab hotkey install` once to register `Cmd+G`.
 5. If `Cmd+G` is not opening gtab, run `gtab hotkey doctor`.
 
 ### TUI shortcuts
@@ -107,7 +107,7 @@ The `config` file in the same directory currently supports:
 - `global_shortcut=cmd+g`
 - `ghostty_shortcut=off|cmd+shift+g`
 
-gtab also installs a user LaunchAgent and a companion helper binary (`gtab-hotkey`) to register a global macOS shortcut. The default `global_shortcut` is `cmd+g`.
+Run `gtab hotkey install` to install a user LaunchAgent and the companion helper binary (`gtab-hotkey`) that register a global macOS shortcut. The default `global_shortcut` is `cmd+g`.
 
 When gtab opens its TUI, it temporarily switches macOS to the most recently used ASCII-capable input source so single-key actions like `q`, `g`, `s`, and `t` keep working. The previous input source is restored when you leave the TUI or launch a workspace.
 The new `launch_mode` setting controls how the built-in shortcut opens gtab. `smart` is the default: it prefers the current Ghostty prompt and falls back to a separate Ghostty window when the current tab does not look safe to inject. `window` always uses a separate launcher window. `inject` always types gtab into the current Ghostty terminal when Ghostty is focused.
