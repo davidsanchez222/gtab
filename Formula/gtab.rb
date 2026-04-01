@@ -1,15 +1,10 @@
-# Regenerate this formula from the tagged release commit before copying it into
-# your tap repository:
-#   ./scripts/render-homebrew-formula.sh <release-commit-sha>
-#
-# The revision below reflects the last committed repo state at generation time.
 class Gtab < Formula
   desc "Ghostty tab workspace manager with an interactive TUI"
   homepage "https://github.com/Franvy/gtab"
   url "https://github.com/Franvy/gtab.git",
-      tag: "v1.3.0",
-      revision: "75cfd3ed8d63af8eabffc12e7fea244a9289b5a0"
-  version "1.3.0"
+      tag: "v1.3.1",
+      revision: "650e7d3747b85d783f2a0211b255d5e38395c3ed"
+  version "1.3.1"
   license "MIT"
   head "https://github.com/Franvy/gtab.git", branch: "main"
 
@@ -35,9 +30,13 @@ class Gtab < Formula
     assert_match version.to_s, shell_output("#{bin}/gtab --version")
     assert_match "demo", shell_output("#{bin}/gtab list")
     assert_match "close_tab = off", shell_output("#{bin}/gtab set")
+    assert_match "launch_mode = smart", shell_output("#{bin}/gtab set")
     assert_match "global_shortcut = cmd+g", shell_output("#{bin}/gtab set")
 
     system bin/"gtab", "set", "close_tab", "on"
     assert_match "close_tab = on", shell_output("#{bin}/gtab set")
+
+    system bin/"gtab", "set", "launch_mode", "window"
+    assert_match "launch_mode = window", shell_output("#{bin}/gtab set")
   end
 end
