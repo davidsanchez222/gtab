@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use gtab::core::{AppEnv, launch_gtab_in_ghostty, parse_global_hotkey};
+use gtab::core::{AppEnv, parse_global_hotkey};
 use std::{
     ffi::c_void,
     path::{Path, PathBuf},
@@ -148,7 +148,16 @@ fn resolve_gtab_binary() -> Result<PathBuf> {
 }
 
 fn launch_gtab(path: &Path) -> Result<()> {
-    launch_gtab_in_ghostty(path)
+    let status = std::process::Command::new(path)
+        .arg("shortcut-launch")
+        .status()
+        .with_context(|| format!("failed to launch {} shortcut entrypoint", path.display()))?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    bail!("shortcut entrypoint exited with status {status}")
 }
 
 fn check_status(status: OSStatus, context: &str) -> Result<()> {

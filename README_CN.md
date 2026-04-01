@@ -49,6 +49,7 @@ gtab hotkey status   查看内建全局快捷键 helper 状态
 gtab hotkey doctor   查看全局快捷键 helper 诊断信息
 gtab set             查看设置
 gtab set close_tab on|off
+gtab set launch_mode smart|window|inject
 gtab set global_shortcut cmd+g
 gtab set ghostty_shortcut off|cmd+shift+g
 ```
@@ -100,12 +101,14 @@ export GTAB_DIR="$HOME/Scripts/ghostty"
 同目录下的 `config` 文件目前支持：
 
 - `close_tab=true|false`
+- `launch_mode=smart|window|inject`
 - `global_shortcut=cmd+g`
 - `ghostty_shortcut=off|cmd+shift+g`
 
 gtab 还会安装一个用户级 LaunchAgent 和配套 helper 二进制 `gtab-hotkey`，用于注册 macOS 全局快捷键。默认的 `global_shortcut` 是 `cmd+g`。
 
-当你通过内建全局快捷键打开 gtab 时，它会临时切换到最近使用过的 ASCII 输入源，这样 `q`、`g`、`t` 这类单键操作不会被中文输入法拦住；退出 TUI 或启动 workspace 之后，会再恢复到之前的输入法。
+当 gtab 打开 TUI 时，它会临时切换到最近使用过的 ASCII 输入源，这样 `q`、`g`、`s`、`t` 这类单键操作不会被中文输入法拦住；退出 TUI 或启动 workspace 之后，会再恢复到之前的输入法。
+新的 `launch_mode` 设置决定全局快捷键如何打开 gtab。默认的 `smart` 会优先复用当前 Ghostty prompt，只有在当前 tab 看起来不适合注入时才回退到独立 Ghostty 窗口；`window` 永远使用独立 launcher 窗口；`inject` 则会在 Ghostty 聚焦时始终把 gtab 输入到当前终端里。
 
 旧的 Ghostty 文本注入快捷键仍然可以通过 `ghostty_shortcut` 使用，但现在只作为兼容模式保留。除非你在调试，否则应保持为 `off`，因为它本质上只是向当前聚焦的 shell 发送 `gtab` 加回车，在 Claude Code、Codex、vim 或 fzf 这类界面里可能失效。
 

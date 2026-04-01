@@ -49,6 +49,7 @@ gtab hotkey status   Show the built-in global hotkey helper status
 gtab hotkey doctor   Show diagnostics for the hotkey helper
 gtab set             Show settings
 gtab set close_tab on|off
+gtab set launch_mode smart|window|inject
 gtab set global_shortcut cmd+g
 gtab set ghostty_shortcut off|cmd+shift+g
 ```
@@ -100,12 +101,14 @@ Each workspace is stored as a plain AppleScript file (`.applescript`) that you c
 The `config` file in the same directory currently supports:
 
 - `close_tab=true|false`
+- `launch_mode=smart|window|inject`
 - `global_shortcut=cmd+g`
 - `ghostty_shortcut=off|cmd+shift+g`
 
 gtab also installs a user LaunchAgent and a companion helper binary (`gtab-hotkey`) to register a global macOS shortcut. The default `global_shortcut` is `cmd+g`.
 
-When gtab is opened through the built-in global shortcut, it temporarily switches macOS to the most recently used ASCII-capable input source so single-key actions like `q`, `g`, and `t` keep working. The previous input source is restored when you leave the TUI or launch a workspace.
+When gtab opens its TUI, it temporarily switches macOS to the most recently used ASCII-capable input source so single-key actions like `q`, `g`, `s`, and `t` keep working. The previous input source is restored when you leave the TUI or launch a workspace.
+The new `launch_mode` setting controls how the built-in shortcut opens gtab. `smart` is the default: it prefers the current Ghostty prompt and falls back to a separate Ghostty window when the current tab does not look safe to inject. `window` always uses a separate launcher window. `inject` always types gtab into the current Ghostty terminal when Ghostty is focused.
 
 The old Ghostty text-injection shortcut is still available through `ghostty_shortcut`, but it is legacy-only. Keep it set to `off` unless you are debugging, because it just sends `gtab` plus Enter to the focused shell and can fail inside Claude Code, Codex, vim, or fzf.
 

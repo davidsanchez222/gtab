@@ -1,6 +1,6 @@
 use crate::core::{
-    AppEnv, GhosttyLauncherTarget, HotkeyAgentStatus, ShortcutLauncherInputSourceGuard, Workspace,
-    close_ghostty_launcher_tab_later, current_ghostty_launcher_target,
+    AppEnv, GhosttyLauncherTarget, HotkeyAgentStatus, LaunchMode, ShortcutLauncherInputSourceGuard,
+    Workspace, close_ghostty_launcher_tab_later, current_ghostty_launcher_target,
     launched_from_shortcut_launcher,
 };
 use anyhow::{Context, Result};
@@ -44,8 +44,8 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
     } else {
         None
     };
-    let (_shortcut_input_source_guard, input_source_warning) = if launched_from_shortcut_launcher {
-        match ShortcutLauncherInputSourceGuard::activate_for_shortcut_launcher() {
+    let (_shortcut_input_source_guard, input_source_warning) =
+        match ShortcutLauncherInputSourceGuard::activate_for_tui() {
             Ok(guard) => (Some(guard), None),
             Err(error) => (
                 None,
@@ -53,10 +53,7 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                     "ASCII input source switch failed; letter shortcuts may not work: {error}"
                 )),
             ),
-        }
-    } else {
-        (None, None)
-    };
+        };
     let mut terminal = TerminalSession::start()?;
     app.refresh_settings_status(env);
 
@@ -159,6 +156,13 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                         }
                         Err(error) => app.set_error(error.to_string()),
                     },
+                    Action::CycleLaunchMode => match env.set_launch_mode(next_launch_mode(env)) {
+                        Ok(()) => {
+                            app.refresh_settings_status(env);
+                            app.set_success(format!("launch_mode = {}", env.launch_mode_display()))
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    },
                     Action::SetGlobalShortcut(shortcut) => {
                         match env.set_global_shortcut(&shortcut) {
                             Ok(()) => match env.restart_hotkey_agent() {
@@ -166,7 +170,7 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                                     app.dialog = app.shortcut_return_dialog.clone();
                                     app.shortcut_input.clear();
                                     app.settings_status = Some(status.clone());
-                                    app.set_success(hotkey_status_message(&status));
+                                    app.set_success(hotkey_status_message(&status, env));
                                 }
                                 Err(error) => app.set_error(format!(
                                     "Saved global shortcut, but hotkey helper restart failed: {error}"
@@ -642,6 +646,7 @@ impl App {
                 Ok(Action::None)
             }
             KeyCode::Char('c') | KeyCode::Char(' ') => Ok(Action::ToggleCloseTab),
+            KeyCode::Char('m') => Ok(Action::CycleLaunchMode),
             KeyCode::Char('g') => {
                 self.open_shortcut_editor(env, Dialog::Settings);
                 Ok(Action::None)
@@ -929,6 +934,7 @@ enum Action {
     Edit(String),
     Delete(String),
     ToggleCloseTab,
+    CycleLaunchMode,
     SetGlobalShortcut(String),
 }
 
@@ -1193,6 +1199,7 @@ fn quick_settings_text(app: &App, env: &AppEnv, width: u16, theme: &Theme) -> Te
         None => Span::styled("unknown", theme.warning),
     };
     let shortcut = env.global_shortcut_display().to_string();
+    let launch_mode = env.launch_mode_display().to_string();
 
     Text::from(vec![
         section_line(width, "Quick Settings", theme),
@@ -1205,6 +1212,10 @@ fn quick_settings_text(app: &App, env: &AppEnv, width: u16, theme: &Theme) -> Te
         ),
         Line::default(),
         section_line(width, "Status", theme),
+        Line::from(vec![
+            Span::styled("mode   ", theme.dim),
+            Span::styled(launch_mode, theme.warning),
+        ]),
         Line::from(vec![Span::styled("helper ", theme.dim), helper]),
         Line::default(),
         Line::from(vec![
@@ -1257,6 +1268,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         Line::from(vec![
             Span::styled("c", theme.accent),
             Span::raw(" toggle  "),
+            Span::styled("m", theme.accent),
+            Span::raw(" mode  "),
             Span::styled("g", theme.accent),
             Span::raw(" shortcut  "),
             Span::styled("Esc", theme.accent),
@@ -1381,7 +1394,7 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
         frame,
         area,
         "Settings",
-        "c toggle | g shortcut | Esc close",
+        "c toggle | m mode | g shortcut | Esc close",
         theme,
     );
     let helper_line = match app.settings_status.as_ref() {
@@ -1405,6 +1418,10 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
             Line::from(vec![
                 Span::styled("close_tab ", theme.dim),
                 Span::styled(env.close_tab_display(), theme.warning),
+            ]),
+            Line::from(vec![
+                Span::styled("launch_mode ", theme.dim),
+                Span::styled(env.launch_mode_display(), theme.warning),
             ]),
             Line::default(),
             section_line(inner.width, "Hotkey", theme),
@@ -1774,17 +1791,27 @@ fn shortcut_key_name_for_char(c: char) -> Option<&'static str> {
     })
 }
 
-fn hotkey_status_message(status: &HotkeyAgentStatus) -> String {
+fn hotkey_status_message(status: &HotkeyAgentStatus, env: &AppEnv) -> String {
     if status.loaded {
         format!(
-            "Global shortcut {} is active via the gtab hotkey helper.",
-            status.global_shortcut
+            "Global shortcut {} is active via the gtab hotkey helper in {} mode.",
+            status.global_shortcut,
+            env.launch_mode_display()
         )
     } else {
         format!(
-            "Global shortcut saved as {}, but the hotkey helper is not loaded.",
-            status.global_shortcut
+            "Global shortcut saved as {}, but the hotkey helper is not loaded. launch_mode remains {}.",
+            status.global_shortcut,
+            env.launch_mode_display()
         )
+    }
+}
+
+fn next_launch_mode(env: &AppEnv) -> &'static str {
+    match env.launch_mode() {
+        LaunchMode::Smart => LaunchMode::Window.as_str(),
+        LaunchMode::Window => LaunchMode::Inject.as_str(),
+        LaunchMode::Inject => LaunchMode::Smart.as_str(),
     }
 }
 
@@ -1823,6 +1850,7 @@ mod tests {
                 close_tab: true,
                 global_shortcut: "cmd+g".to_string(),
                 ghostty_shortcut: "off".to_string(),
+                launch_mode: LaunchMode::Smart,
             },
         }
     }
@@ -1894,9 +1922,20 @@ mod tests {
 
         assert!(lines.iter().any(|line| line.contains("shortcut cmd+g")));
         assert!(lines.iter().any(|line| line.contains("click / g")));
+        assert!(lines.iter().any(|line| line.contains("mode   smart")));
         assert!(lines.iter().any(|line| line.contains("helper loaded")));
         assert!(!lines.iter().any(|line| line.contains("close_tab")));
         assert!(!lines.iter().any(|line| line.contains("legacy")));
+    }
+
+    #[test]
+    fn next_launch_mode_cycles_all_values() {
+        let mut test_env = env();
+        assert_eq!(next_launch_mode(&test_env), "window");
+        test_env.config.launch_mode = LaunchMode::Window;
+        assert_eq!(next_launch_mode(&test_env), "inject");
+        test_env.config.launch_mode = LaunchMode::Inject;
+        assert_eq!(next_launch_mode(&test_env), "smart");
     }
 
     #[test]

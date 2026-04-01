@@ -53,6 +53,7 @@ fn run() -> Result<()> {
             handle_set(&mut env, key.as_deref(), value.as_deref())
         }
         (Some(Commands::Hotkey { command }), None) => handle_hotkey(&env, command),
+        (Some(Commands::ShortcutLaunch), None) => env.launch_from_shortcut(),
         (Some(Commands::Shortcut), None) => {
             let launcher_path = env.ensure_launcher_script()?;
             println!("{}", format_shortcut_guide(&env, &launcher_path));
@@ -79,13 +80,22 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
             Ok(())
         }
         (Some("close_tab"), Some(_)) => bail!("close_tab value must be 'on' or 'off'"),
+        (Some("launch_mode"), Some(mode)) => {
+            env.set_launch_mode(mode)?;
+            println!("Set launch_mode = {}", env.launch_mode_display());
+            Ok(())
+        }
         (Some("global_shortcut"), Some(shortcut)) => {
             env.set_global_shortcut(shortcut)?;
             println!("Set global_shortcut = {}", env.global_shortcut_display());
             match env.restart_hotkey_agent() {
                 Ok(status) => println!(
                     "{}",
-                    format_hotkey_status(&status, env.ghostty_shortcut_display())
+                    format_hotkey_status(
+                        &status,
+                        env.launch_mode_display(),
+                        env.ghostty_shortcut_display(),
+                    )
                 ),
                 Err(error) => {
                     println!("Hotkey helper restart failed: {error}");
@@ -124,7 +134,11 @@ fn handle_hotkey(env: &AppEnv, command: Option<HotkeyCommands>) -> Result<()> {
             let status = env.install_hotkey_agent()?;
             println!(
                 "{}",
-                format_hotkey_status(&status, env.ghostty_shortcut_display())
+                format_hotkey_status(
+                    &status,
+                    env.launch_mode_display(),
+                    env.ghostty_shortcut_display(),
+                )
             );
             Ok(())
         }
@@ -132,7 +146,11 @@ fn handle_hotkey(env: &AppEnv, command: Option<HotkeyCommands>) -> Result<()> {
             let status = env.restart_hotkey_agent()?;
             println!(
                 "{}",
-                format_hotkey_status(&status, env.ghostty_shortcut_display())
+                format_hotkey_status(
+                    &status,
+                    env.launch_mode_display(),
+                    env.ghostty_shortcut_display(),
+                )
             );
             Ok(())
         }
@@ -140,7 +158,11 @@ fn handle_hotkey(env: &AppEnv, command: Option<HotkeyCommands>) -> Result<()> {
             let status = env.hotkey_agent_status()?;
             println!(
                 "{}",
-                format_hotkey_status(&status, env.ghostty_shortcut_display())
+                format_hotkey_status(
+                    &status,
+                    env.launch_mode_display(),
+                    env.ghostty_shortcut_display(),
+                )
             );
             Ok(())
         }
@@ -150,6 +172,7 @@ fn handle_hotkey(env: &AppEnv, command: Option<HotkeyCommands>) -> Result<()> {
                 "{}",
                 format_hotkey_doctor(
                     &status,
+                    env.launch_mode_display(),
                     env.ghostty_shortcut_display(),
                     &env.hotkey_log_path()
                 )

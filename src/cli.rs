@@ -40,6 +40,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<HotkeyCommands>,
     },
+    #[command(hide = true)]
+    ShortcutLaunch,
     /// Show the manual launcher fallback for external shortcut tools.
     Shortcut,
 }
