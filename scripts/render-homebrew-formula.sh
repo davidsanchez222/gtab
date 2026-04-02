@@ -45,8 +45,8 @@ class Gtab < Formula
 
   def caveats
     <<~EOS
-      Run this once to enable the built-in global hotkey helper:
-        gtab hotkey install
+      Run this once to enable the default Ghostty-local Cmd+G:
+        gtab init
 
       Workspaces are stored in ~/.config/gtab/ by default.
       Override with: export GTAB_DIR="/your/path"
@@ -66,14 +66,13 @@ class Gtab < Formula
     assert_match version.to_s, shell_output("#{bin}/gtab --version")
     assert_match "demo", shell_output("#{bin}/gtab list")
     assert_match "close_tab = off", shell_output("#{bin}/gtab set")
-    assert_match "launch_mode = smart", shell_output("#{bin}/gtab set")
-    assert_match "global_shortcut = cmd+g", shell_output("#{bin}/gtab set")
+    assert_match "ghostty_shortcut = cmd+g", shell_output("#{bin}/gtab set")
+    assert_match "Ghostty-local shortcut is the default fast path", shell_output("#{bin}/gtab set")
 
     system bin/"gtab", "set", "close_tab", "on"
     assert_match "close_tab = on", shell_output("#{bin}/gtab set")
 
-    system bin/"gtab", "set", "launch_mode", "window"
-    assert_match "launch_mode = window", shell_output("#{bin}/gtab set")
+    assert_match "launch_mode has been removed", shell_output("#{bin}/gtab set launch_mode window", 1)
   end
 end
 EOF

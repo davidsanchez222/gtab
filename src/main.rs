@@ -2,11 +2,8 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use gtab::{
     app,
-    cli::{Cli, Commands, HotkeyCommands},
-    core::{
-        AppEnv, format_hotkey_doctor, format_hotkey_status, format_settings, format_shortcut_guide,
-        format_workspace_list,
-    },
+    cli::{Cli, Commands},
+    core::{AppEnv, format_settings, format_workspace_list},
 };
 
 fn main() {
@@ -32,6 +29,7 @@ fn run() -> Result<()> {
             env.launch_workspace(&name)
         }
         (Some(Commands::Tui), None) => app::run_tui(&mut env),
+        (Some(Commands::Init), None) => handle_init(&mut env),
         (Some(Commands::List), None) => {
             let workspaces = env.list_workspaces()?;
             println!("{}", format_workspace_list(&workspaces));
@@ -51,13 +49,6 @@ fn run() -> Result<()> {
         }
         (Some(Commands::Set { key, value }), None) => {
             handle_set(&mut env, key.as_deref(), value.as_deref())
-        }
-        (Some(Commands::Hotkey { command }), None) => handle_hotkey(&env, command),
-        (Some(Commands::ShortcutLaunch), None) => env.launch_from_shortcut(),
-        (Some(Commands::Shortcut), None) => {
-            let launcher_path = env.ensure_launcher_script()?;
-            println!("{}", format_shortcut_guide(&env, &launcher_path));
-            Ok(())
         }
         _ => bail!("unexpected CLI arguments"),
     }
@@ -80,29 +71,11 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
             Ok(())
         }
         (Some("close_tab"), Some(_)) => bail!("close_tab value must be 'on' or 'off'"),
-        (Some("launch_mode"), Some(mode)) => {
-            env.set_launch_mode(mode)?;
-            println!("Set launch_mode = {}", env.launch_mode_display());
-            Ok(())
+        (Some("launch_mode"), Some(_)) => {
+            bail!("launch_mode has been removed; gtab only uses the Ghostty-local shortcut now")
         }
-        (Some("global_shortcut"), Some(shortcut)) => {
-            env.set_global_shortcut(shortcut)?;
-            println!("Set global_shortcut = {}", env.global_shortcut_display());
-            match env.restart_hotkey_agent() {
-                Ok(status) => println!(
-                    "{}",
-                    format_hotkey_status(
-                        &status,
-                        env.launch_mode_display(),
-                        env.ghostty_shortcut_display(),
-                    )
-                ),
-                Err(error) => {
-                    println!("Hotkey helper restart failed: {error}");
-                    println!("Run `gtab hotkey install` after installing both binaries.");
-                }
-            }
-            Ok(())
+        (Some("global_shortcut"), Some(_)) => {
+            bail!("global_shortcut has been removed; gtab only uses the Ghostty-local shortcut now")
         }
         (Some("ghostty_shortcut"), Some(shortcut)) => {
             let sync = env.set_ghostty_shortcut(shortcut)?;
@@ -112,13 +85,9 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
                 sync.include_path.display()
             );
             if env.ghostty_shortcut_display() == "off" {
-                println!("Legacy Ghostty text-injection shortcut is now disabled.");
-                println!("Use the built-in hotkey helper with `gtab hotkey doctor` if needed.");
+                println!("Ghostty-local shortcut is now disabled.");
             } else {
-                println!("This legacy shortcut types `gtab` into the focused shell.");
-                println!(
-                    "For Claude Code / Codex, rely on the built-in global hotkey helper instead."
-                );
+                println!("This shortcut types `gtab` into the focused Ghostty shell.");
                 println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
             }
             Ok(())
@@ -128,61 +97,12 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
     }
 }
 
-fn handle_hotkey(env: &AppEnv, command: Option<HotkeyCommands>) -> Result<()> {
-    match command.unwrap_or(HotkeyCommands::Status) {
-        HotkeyCommands::Install => {
-            let status = env.install_hotkey_agent()?;
-            println!(
-                "{}",
-                format_hotkey_status(
-                    &status,
-                    env.launch_mode_display(),
-                    env.ghostty_shortcut_display(),
-                )
-            );
-            Ok(())
-        }
-        HotkeyCommands::Restart => {
-            let status = env.restart_hotkey_agent()?;
-            println!(
-                "{}",
-                format_hotkey_status(
-                    &status,
-                    env.launch_mode_display(),
-                    env.ghostty_shortcut_display(),
-                )
-            );
-            Ok(())
-        }
-        HotkeyCommands::Status => {
-            let status = env.hotkey_agent_status()?;
-            println!(
-                "{}",
-                format_hotkey_status(
-                    &status,
-                    env.launch_mode_display(),
-                    env.ghostty_shortcut_display(),
-                )
-            );
-            Ok(())
-        }
-        HotkeyCommands::Doctor => {
-            let status = env.hotkey_agent_status()?;
-            println!(
-                "{}",
-                format_hotkey_doctor(
-                    &status,
-                    env.launch_mode_display(),
-                    env.ghostty_shortcut_display(),
-                    &env.hotkey_log_path()
-                )
-            );
-            Ok(())
-        }
-        HotkeyCommands::Uninstall => {
-            env.uninstall_hotkey_agent()?;
-            println!("Hotkey helper uninstalled.");
-            Ok(())
-        }
-    }
+fn handle_init(env: &mut AppEnv) -> Result<()> {
+    let sync = env.init_shortcuts()?;
+    println!("Initialized Ghostty-local shortcut.");
+    println!("  ghostty_shortcut = {}", sync.shortcut);
+    println!("  ghostty_config = {}", sync.config_path.display());
+    println!("  ghostty_include = {}", sync.include_path.display());
+    println!("Reload Ghostty config or restart Ghostty, then press Cmd+G inside Ghostty.");
+    Ok(())
 }

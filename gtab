@@ -6,6 +6,16 @@ BASE_DIR="${GTAB_DIR:-$HOME/.config/gtab}"
 
 mkdir -p "$BASE_DIR"
 
+CONFIG_FILE="$BASE_DIR/config"
+CLOSE_TAB=false
+if [[ -f "$CONFIG_FILE" ]]; then
+  while IFS='=' read -r key val; do
+    case "$key" in
+      close_tab) CLOSE_TAB="$val" ;;
+    esac
+  done < "$CONFIG_FILE"
+fi
+
 # Color support: respect NO_COLOR (https://no-color.org) and non-TTY
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
   BOLD=$'\033[1m'  DIM=$'\033[2m'  ITALIC=$'\033[3m'  RESET=$'\033[0m'
@@ -31,6 +41,8 @@ usage() {
   printf '   %sgtab list%s             List all saved workspaces\n' "$BOLD" "$RESET"
   printf '   %sgtab edit%s <%s%sname%s>      Edit a workspace script\n' "$BOLD" "$RESET" "$ITALIC" "$YELLOW" "$RESET"
   printf '   %sgtab remove%s <%s%sname%s>    Remove a workspace\n' "$BOLD" "$RESET" "$ITALIC" "$YELLOW" "$RESET"
+  printf '   %sgtab set%s               Show settings\n' "$BOLD" "$RESET"
+  printf '   %sgtab set%s <%s%skey%s> <%s%svalue%s>   Change a setting\n' "$BOLD" "$RESET" "$ITALIC" "$YELLOW" "$RESET" "$ITALIC" "$YELLOW" "$RESET"
   printf '   %sgtab --version%s           Show version\n' "$BOLD" "$RESET"
   echo
   printf ' %sWorkspaces:%s %s%s%s\n' "$DIM" "$RESET" "$DIM" "$BASE_DIR" "$RESET"
@@ -114,6 +126,32 @@ ASCRIPT
     "${EDITOR:-vim}" "$BASE_DIR/$name.applescript"
     ;;
 
+  set)
+    key="${2:-}"
+    val="${3:-}"
+    if [[ -z "$key" ]]; then
+      printf ' %sSettings:%s\n' "$BOLD" "$RESET"
+      local_close=$CLOSE_TAB
+      [[ "$local_close" == "true" ]] && display="on" || display="off"
+      printf '   %sclose_tab%s = %s%s%s\n' "$CYAN" "$RESET" "$YELLOW" "$display" "$RESET"
+      printf '   %s(close current tab after launching a workspace)%s\n' "$DIM" "$RESET"
+    else
+      case "$key" in
+        close_tab)
+          case "$val" in
+            on|true)   new_val=true  ;;
+            off|false) new_val=false ;;
+            *) err "close_tab value must be 'on' or 'off'"; exit 1 ;;
+          esac
+          printf 'close_tab=%s\n' "$new_val" > "$CONFIG_FILE"
+          [[ "$new_val" == "true" ]] && display="on" || display="off"
+          ok "Set ${CYAN}close_tab${RESET} = ${YELLOW}${display}${RESET}"
+          ;;
+        *) err "unknown setting '$key'"; exit 1 ;;
+      esac
+    fi
+    ;;
+
   remove)
     name="${2:-}"
     [ -n "$name" ] || { err "missing workspace name"; exit 1; }
@@ -124,7 +162,7 @@ ASCRIPT
     ;;
 
   --version|-v)
-    printf '%s\n' "gtab 1.2.1"
+    printf '%s\n' "gtab 1.3.1"
     ;;
 
   ""|--help|-h)
@@ -137,5 +175,8 @@ ASCRIPT
     [ -f "$file" ] || { err "workspace '$cmd' not found — run ${BOLD}gtab list${RESET}${RED} to see available workspaces"; exit 1; }
     printf ' %s▸%s Launching %s"%s"%s...\n' "$CYAN" "$RESET" "$YELLOW" "$cmd" "$RESET"
     osascript "$file"
+    if [[ "$CLOSE_TAB" == "true" ]]; then
+      kill -HUP "$PPID"
+    fi
     ;;
 esac

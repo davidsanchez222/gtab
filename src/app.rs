@@ -1,8 +1,4 @@
-use crate::core::{
-    AppEnv, GhosttyLauncherTarget, HotkeyAgentStatus, LaunchMode, ShortcutLauncherInputSourceGuard,
-    Workspace, close_ghostty_launcher_tab_later, current_ghostty_launcher_target,
-    launched_from_shortcut_launcher,
-};
+use crate::core::{AppEnv, ShortcutLauncherInputSourceGuard, Workspace};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
@@ -35,15 +31,7 @@ const MIN_HEIGHT: u16 = 22;
 const MAIN_LIST_WIDTH: u16 = 24;
 
 pub fn run_tui(env: &mut AppEnv) -> Result<()> {
-    let launcher_status = env.ensure_launcher_script();
-    let sync_status = env.ensure_ghostty_shortcut();
     let mut app = App::new(env.list_workspaces()?);
-    let launched_from_shortcut_launcher = launched_from_shortcut_launcher();
-    let launcher_target = if launched_from_shortcut_launcher {
-        current_ghostty_launcher_target().ok().flatten()
-    } else {
-        None
-    };
     let (_shortcut_input_source_guard, input_source_warning) =
         match ShortcutLauncherInputSourceGuard::activate_for_tui() {
             Ok(guard) => (Some(guard), None),
@@ -55,13 +43,8 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
             ),
         };
     let mut terminal = TerminalSession::start()?;
-    app.refresh_settings_status(env);
 
-    if let Err(error) = launcher_status {
-        app.set_error(format!("Launcher setup failed: {error}"));
-    } else if let Err(error) = sync_status {
-        app.set_error(format!("Legacy Ghostty shortcut sync failed: {error}"));
-    } else if let Some(warning) = input_source_warning {
+    if let Some(warning) = input_source_warning {
         app.set_error(warning);
     }
 
@@ -86,13 +69,7 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
 
                 match app.handle_key(key, env)? {
                     Action::None => {}
-                    Action::Quit => {
-                        if exit_tui_from_shortcut_launcher(&mut terminal, launcher_target.as_ref())?
-                        {
-                            return Ok(());
-                        }
-                        break;
-                    }
+                    Action::Quit => break,
                     Action::Refresh => match env.list_workspaces() {
                         Ok(workspaces) => {
                             app.reload(workspaces);
@@ -101,12 +78,7 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                         Err(error) => app.set_error(error.to_string()),
                     },
                     Action::Launch(name) => {
-                        launch_workspace_from_tui(
-                            &mut terminal,
-                            env,
-                            &name,
-                            launcher_target.as_ref(),
-                        )?;
+                        launch_workspace_from_tui(&mut terminal, env, &name)?;
                         break;
                     }
                     Action::Save(name) => {
@@ -151,31 +123,26 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                     },
                     Action::ToggleCloseTab => match env.set_close_tab(!env.config.close_tab) {
                         Ok(()) => {
-                            app.refresh_settings_status(env);
                             app.set_success(format!("close_tab = {}", env.close_tab_display()))
                         }
                         Err(error) => app.set_error(error.to_string()),
                     },
-                    Action::CycleLaunchMode => match env.set_launch_mode(next_launch_mode(env)) {
-                        Ok(()) => {
-                            app.refresh_settings_status(env);
-                            app.set_success(format!("launch_mode = {}", env.launch_mode_display()))
-                        }
-                        Err(error) => app.set_error(error.to_string()),
-                    },
-                    Action::SetGlobalShortcut(shortcut) => {
-                        match env.set_global_shortcut(&shortcut) {
-                            Ok(()) => match env.restart_hotkey_agent() {
-                                Ok(status) => {
-                                    app.dialog = app.shortcut_return_dialog.clone();
-                                    app.shortcut_input.clear();
-                                    app.settings_status = Some(status.clone());
-                                    app.set_success(hotkey_status_message(&status, env));
+                    Action::SetGhosttyShortcut(shortcut) => {
+                        match env.set_ghostty_shortcut(&shortcut) {
+                            Ok(sync) => {
+                                app.dialog = app.shortcut_return_dialog.clone();
+                                app.shortcut_input.clear();
+                                if sync.shortcut == "off" {
+                                    app.set_success(
+                                    "Ghostty-local shortcut disabled. Run `gtab init` to restore Cmd+G.",
+                                );
+                                } else {
+                                    app.set_success(format!(
+                                    "Ghostty-local shortcut saved as {}. Reload Ghostty config to apply it.",
+                                    sync.shortcut
+                                ));
                                 }
-                                Err(error) => app.set_error(format!(
-                                    "Saved global shortcut, but hotkey helper restart failed: {error}"
-                                )),
-                            },
+                            }
                             Err(error) => app.set_error(error.to_string()),
                         }
                     }
@@ -184,7 +151,7 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
             Event::Mouse(mouse) => match app.handle_mouse(mouse, env)? {
                 Action::None => {}
                 Action::Launch(name) => {
-                    launch_workspace_from_tui(&mut terminal, env, &name, launcher_target.as_ref())?;
+                    launch_workspace_from_tui(&mut terminal, env, &name)?;
                     break;
                 }
                 _ => {}
@@ -200,48 +167,18 @@ fn launch_workspace_from_tui(
     terminal: &mut TerminalSession,
     env: &AppEnv,
     name: &str,
-    launcher_target: Option<&GhosttyLauncherTarget>,
 ) -> Result<()> {
     terminal.suspend()?;
 
     match env.launch_workspace(name) {
         Ok(()) => {
-            if let Some(target) = launcher_target {
-                close_shortcut_launcher_tab(
-                    target,
-                    "workspace launched, but failed to close the shortcut launcher tab",
-                );
-            } else {
-                terminal.resume()?;
-            }
+            terminal.resume()?;
             Ok(())
         }
         Err(error) => {
             terminal.resume()?;
             Err(error)
         }
-    }
-}
-
-fn exit_tui_from_shortcut_launcher(
-    terminal: &mut TerminalSession,
-    launcher_target: Option<&GhosttyLauncherTarget>,
-) -> Result<bool> {
-    let Some(target) = launcher_target else {
-        return Ok(false);
-    };
-
-    terminal.suspend()?;
-    close_shortcut_launcher_tab(
-        target,
-        "failed to close the shortcut launcher tab after quitting",
-    );
-    Ok(true)
-}
-
-fn close_shortcut_launcher_tab(target: &GhosttyLauncherTarget, context: &str) {
-    if let Err(error) = close_ghostty_launcher_tab_later(target) {
-        eprintln!("warning: {context}: {error}");
     }
 }
 
@@ -320,7 +257,7 @@ enum Dialog {
     Save,
     ConfirmDelete,
     Settings,
-    EditGlobalShortcut,
+    EditGhosttyShortcut,
     Help,
 }
 
@@ -357,7 +294,6 @@ struct App {
     save_input: String,
     shortcut_input: String,
     shortcut_return_dialog: Dialog,
-    settings_status: Option<HotkeyAgentStatus>,
     status: Option<StatusLine>,
     status_expiry: Option<Instant>,
 }
@@ -377,7 +313,6 @@ impl App {
             save_input: String::new(),
             shortcut_input: String::new(),
             shortcut_return_dialog: Dialog::None,
-            settings_status: None,
             status: Some(StatusLine {
                 kind: StatusKind::Info,
                 text: "Enter launch  / filter  ? help".to_string(),
@@ -397,23 +332,16 @@ impl App {
         self.save_input.clear();
         self.shortcut_input.clear();
         self.shortcut_return_dialog = Dialog::None;
-        self.settings_status = None;
     }
 
-    fn refresh_settings_status(&mut self, env: &AppEnv) {
-        self.settings_status = env.hotkey_agent_status().ok();
-    }
-
-    fn open_settings(&mut self, env: &AppEnv) {
-        self.refresh_settings_status(env);
+    fn open_settings(&mut self, _env: &AppEnv) {
         self.dialog = Dialog::Settings;
     }
 
     fn open_shortcut_editor(&mut self, env: &AppEnv, return_dialog: Dialog) {
-        self.refresh_settings_status(env);
         self.shortcut_return_dialog = return_dialog;
-        self.dialog = Dialog::EditGlobalShortcut;
-        self.shortcut_input = env.global_shortcut_display().to_string();
+        self.dialog = Dialog::EditGhosttyShortcut;
+        self.shortcut_input = env.ghostty_shortcut_display().to_string();
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -587,7 +515,7 @@ impl App {
             Dialog::Save => self.handle_save_key(key),
             Dialog::ConfirmDelete => self.handle_delete_key(key),
             Dialog::Settings => self.handle_settings_key(key, env),
-            Dialog::EditGlobalShortcut => self.handle_shortcut_key(key),
+            Dialog::EditGhosttyShortcut => self.handle_shortcut_key(key),
             Dialog::Help => self.handle_help_key(key),
             Dialog::None if self.search_active() => self.handle_search_key(key),
             Dialog::None => self.handle_main_key(key, env),
@@ -646,7 +574,6 @@ impl App {
                 Ok(Action::None)
             }
             KeyCode::Char('c') | KeyCode::Char(' ') => Ok(Action::ToggleCloseTab),
-            KeyCode::Char('m') => Ok(Action::CycleLaunchMode),
             KeyCode::Char('g') => {
                 self.open_shortcut_editor(env, Dialog::Settings);
                 Ok(Action::None)
@@ -665,11 +592,11 @@ impl App {
             KeyCode::Enter => {
                 let shortcut = self.shortcut_input.trim().to_string();
                 if shortcut.is_empty() {
-                    self.set_error("Global shortcut cannot be empty");
+                    self.set_error("Ghostty shortcut cannot be empty");
                     return Ok(Action::None);
                 }
 
-                return Ok(Action::SetGlobalShortcut(shortcut));
+                return Ok(Action::SetGhosttyShortcut(shortcut));
             }
             KeyCode::Backspace => {
                 self.shortcut_input.pop();
@@ -934,8 +861,7 @@ enum Action {
     Edit(String),
     Delete(String),
     ToggleCloseTab,
-    CycleLaunchMode,
-    SetGlobalShortcut(String),
+    SetGhosttyShortcut(String),
 }
 
 #[derive(Clone, Copy)]
@@ -1038,7 +964,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, env: &AppEnv) {
         Dialog::Save => draw_save_dialog(frame, app, &theme),
         Dialog::ConfirmDelete => draw_delete_dialog(frame, app, &theme),
         Dialog::Settings => draw_settings_dialog(frame, app, env, &theme),
-        Dialog::EditGlobalShortcut => draw_shortcut_dialog(frame, app, env, &theme),
+        Dialog::EditGhosttyShortcut => draw_shortcut_dialog(frame, app, env, &theme),
         Dialog::Help => draw_help_dialog(frame, &theme),
     }
 }
@@ -1192,14 +1118,8 @@ fn workspace_tabs_text(app: &App, theme: &Theme) -> Text<'static> {
     Text::from(Line::from(spans))
 }
 
-fn quick_settings_text(app: &App, env: &AppEnv, width: u16, theme: &Theme) -> Text<'static> {
-    let helper = match app.settings_status.as_ref() {
-        Some(status) if status.loaded => Span::styled("loaded", theme.success),
-        Some(_) => Span::styled("not loaded", theme.warning),
-        None => Span::styled("unknown", theme.warning),
-    };
-    let shortcut = env.global_shortcut_display().to_string();
-    let launch_mode = env.launch_mode_display().to_string();
+fn quick_settings_text(_app: &App, env: &AppEnv, width: u16, theme: &Theme) -> Text<'static> {
+    let shortcut = env.ghostty_shortcut_display().to_string();
 
     Text::from(vec![
         section_line(width, "Quick Settings", theme),
@@ -1212,11 +1132,8 @@ fn quick_settings_text(app: &App, env: &AppEnv, width: u16, theme: &Theme) -> Te
         ),
         Line::default(),
         section_line(width, "Status", theme),
-        Line::from(vec![
-            Span::styled("mode   ", theme.dim),
-            Span::styled(launch_mode, theme.warning),
-        ]),
-        Line::from(vec![Span::styled("helper ", theme.dim), helper]),
+        Line::from(vec![Span::styled("same-shell in Ghostty", theme.warning)]),
+        Line::from("Ghostty-local only"),
         Line::default(),
         Line::from(vec![
             Span::styled("t", theme.accent),
@@ -1268,14 +1185,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         Line::from(vec![
             Span::styled("c", theme.accent),
             Span::raw(" toggle  "),
-            Span::styled("m", theme.accent),
-            Span::raw(" mode  "),
             Span::styled("g", theme.accent),
-            Span::raw(" shortcut  "),
+            Span::raw(" ghostty shortcut  "),
             Span::styled("Esc", theme.accent),
             Span::raw(" close"),
         ])
-    } else if matches!(app.dialog, Dialog::EditGlobalShortcut) {
+    } else if matches!(app.dialog, Dialog::EditGhosttyShortcut) {
         Line::from(vec![
             Span::styled("Enter", theme.accent),
             Span::raw(" save  "),
@@ -1301,10 +1216,10 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Span::raw(" save  "),
             Span::styled("d", theme.accent),
             Span::raw(" remove  "),
-            Span::styled("c", theme.accent),
-            Span::raw(" close  "),
+            Span::styled("t", theme.accent),
+            Span::raw(" settings  "),
             Span::styled("g", theme.accent),
-            Span::raw(" shortcut  "),
+            Span::raw(" ghostty shortcut  "),
             Span::styled("?", theme.accent),
             Span::raw(" help  "),
             Span::styled("q", theme.accent),
@@ -1388,30 +1303,15 @@ fn draw_delete_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     );
 }
 
-fn draw_settings_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &Theme) {
+fn draw_settings_dialog(frame: &mut Frame<'_>, _app: &App, env: &AppEnv, theme: &Theme) {
     let area = centered_rect(68, 52, frame.area());
     let inner = draw_dialog_shell(
         frame,
         area,
         "Settings",
-        "c toggle | m mode | g shortcut | Esc close",
+        "c toggle | g ghostty shortcut | Esc close",
         theme,
     );
-    let helper_line = match app.settings_status.as_ref() {
-        Some(status) if status.loaded => Line::from(vec![
-            Span::styled("helper    ", theme.dim),
-            Span::styled("loaded", theme.success),
-        ]),
-        Some(_) => Line::from(vec![
-            Span::styled("helper    ", theme.dim),
-            Span::styled("not loaded", theme.warning),
-        ]),
-        None => Line::from(vec![
-            Span::styled("helper    ", theme.dim),
-            Span::styled("unknown", theme.warning),
-        ]),
-    };
-
     frame.render_widget(
         Paragraph::new(Text::from(vec![
             section_line(inner.width, "Workspace", theme),
@@ -1419,20 +1319,19 @@ fn draw_settings_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
                 Span::styled("close_tab ", theme.dim),
                 Span::styled(env.close_tab_display(), theme.warning),
             ]),
-            Line::from(vec![
-                Span::styled("launch_mode ", theme.dim),
-                Span::styled(env.launch_mode_display(), theme.warning),
-            ]),
             Line::default(),
-            section_line(inner.width, "Hotkey", theme),
+            section_line(inner.width, "Shortcut", theme),
             Line::from(vec![
-                Span::styled("shortcut  ", theme.dim),
-                Span::styled(env.global_shortcut_display(), theme.warning),
-            ]),
-            helper_line,
-            Line::from(vec![
-                Span::styled("legacy    ", theme.dim),
+                Span::styled("ghostty   ", theme.dim),
                 Span::styled(env.ghostty_shortcut_display(), theme.warning),
+            ]),
+            Line::from(vec![
+                Span::styled("mode      ", theme.dim),
+                Span::styled("same-shell launch", theme.warning),
+            ]),
+            Line::from(vec![
+                Span::styled("scope     ", theme.dim),
+                Span::styled("Ghostty current shell only", theme.warning),
             ]),
         ]))
         .wrap(Wrap { trim: true }),
@@ -1445,12 +1344,12 @@ fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
     let inner = draw_dialog_shell(
         frame,
         area,
-        "Edit Global Shortcut",
+        "Edit Ghostty Shortcut",
         "Enter save | Esc back",
         theme,
     );
     let current_input = if app.shortcut_input.is_empty() {
-        env.global_shortcut_display()
+        env.ghostty_shortcut_display()
     } else {
         app.shortcut_input.as_str()
     };
@@ -1462,12 +1361,11 @@ fn draw_shortcut_dialog(frame: &mut Frame<'_>, app: &App, env: &AppEnv, theme: &
             Line::default(),
             section_line(inner.width, "Input", theme),
             Line::from("Press the shortcut directly, or type it manually."),
+            Line::from("This types `gtab` into the focused Ghostty shell."),
             Line::default(),
             section_line(inner.width, "Examples", theme),
             Line::from("cmd+g"),
             Line::from("cmd+shift+g"),
-            Line::from("cmd+/"),
-            Line::from("cmd+left"),
             Line::from("off"),
         ]))
         .wrap(Wrap { trim: true }),
@@ -1489,13 +1387,13 @@ fn draw_help_dialog(frame: &mut Frame<'_>, theme: &Theme) {
             Line::default(),
             section_line(inner.width, "Actions", theme),
             Line::from("Enter launch  a save  e edit  d remove"),
-            Line::from("g edit shortcut  r reload  t settings"),
+            Line::from("g edit Ghostty shortcut  r reload  t settings"),
             Line::from("q quit"),
             Line::default(),
             section_line(inner.width, "Layout", theme),
             Line::from("Left pane lists saved workspaces."),
             Line::from("Middle pane shows saved tabs in order."),
-            Line::from("Right pane shows shortcut and helper status."),
+            Line::from("Right pane shows the Ghostty shortcut first."),
             Line::default(),
             section_line(inner.width, "Mouse", theme),
             Line::from("click select  double-click launch"),
@@ -1791,30 +1689,6 @@ fn shortcut_key_name_for_char(c: char) -> Option<&'static str> {
     })
 }
 
-fn hotkey_status_message(status: &HotkeyAgentStatus, env: &AppEnv) -> String {
-    if status.loaded {
-        format!(
-            "Global shortcut {} is active via the gtab hotkey helper in {} mode.",
-            status.global_shortcut,
-            env.launch_mode_display()
-        )
-    } else {
-        format!(
-            "Global shortcut saved as {}, but the hotkey helper is not loaded. launch_mode remains {}.",
-            status.global_shortcut,
-            env.launch_mode_display()
-        )
-    }
-}
-
-fn next_launch_mode(env: &AppEnv) -> &'static str {
-    match env.launch_mode() {
-        LaunchMode::Smart => LaunchMode::Window.as_str(),
-        LaunchMode::Window => LaunchMode::Inject.as_str(),
-        LaunchMode::Inject => LaunchMode::Smart.as_str(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1848,9 +1722,7 @@ mod tests {
             config_file: PathBuf::from("/tmp/gtab/config"),
             config: Config {
                 close_tab: true,
-                global_shortcut: "cmd+g".to_string(),
-                ghostty_shortcut: "off".to_string(),
-                launch_mode: LaunchMode::Smart,
+                ghostty_shortcut: "cmd+g".to_string(),
             },
         }
     }
@@ -1908,34 +1780,21 @@ mod tests {
     }
 
     #[test]
-    fn quick_settings_show_shortcut_and_helper_status() {
+    fn quick_settings_show_shortcut_status() {
         let theme = Theme::detect();
-        let mut app = App::new(vec![workspace("alpha")]);
-        app.settings_status = Some(HotkeyAgentStatus {
-            global_shortcut: "cmd+g".to_string(),
-            plist_path: PathBuf::from("/tmp/com.franvy.gtab.hotkey.plist"),
-            helper_path: PathBuf::from("/tmp/gtab-hotkey"),
-            loaded: true,
-        });
+        let app = App::new(vec![workspace("alpha")]);
 
         let lines = text_lines(quick_settings_text(&app, &env(), 28, &theme));
 
         assert!(lines.iter().any(|line| line.contains("shortcut cmd+g")));
         assert!(lines.iter().any(|line| line.contains("click / g")));
-        assert!(lines.iter().any(|line| line.contains("mode   smart")));
-        assert!(lines.iter().any(|line| line.contains("helper loaded")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("same-shell in Ghostty"))
+        );
+        assert!(lines.iter().any(|line| line.contains("Ghostty-local only")));
         assert!(!lines.iter().any(|line| line.contains("close_tab")));
-        assert!(!lines.iter().any(|line| line.contains("legacy")));
-    }
-
-    #[test]
-    fn next_launch_mode_cycles_all_values() {
-        let mut test_env = env();
-        assert_eq!(next_launch_mode(&test_env), "window");
-        test_env.config.launch_mode = LaunchMode::Window;
-        assert_eq!(next_launch_mode(&test_env), "inject");
-        test_env.config.launch_mode = LaunchMode::Inject;
-        assert_eq!(next_launch_mode(&test_env), "smart");
     }
 
     #[test]
@@ -1947,7 +1806,7 @@ mod tests {
                 .unwrap(),
             Action::None
         );
-        assert_eq!(app.dialog, Dialog::EditGlobalShortcut);
+        assert_eq!(app.dialog, Dialog::EditGhosttyShortcut);
         assert_eq!(app.shortcut_return_dialog, Dialog::None);
         assert_eq!(app.shortcut_input, "cmd+g");
     }
@@ -2000,7 +1859,7 @@ mod tests {
             app.handle_mouse(left_click(31, 2), &env()).unwrap(),
             Action::None
         );
-        assert_eq!(app.dialog, Dialog::EditGlobalShortcut);
+        assert_eq!(app.dialog, Dialog::EditGhosttyShortcut);
         assert_eq!(app.shortcut_return_dialog, Dialog::None);
         assert_eq!(app.shortcut_input, "cmd+g");
     }
