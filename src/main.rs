@@ -80,13 +80,18 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
         (Some("ghostty_shortcut"), Some(shortcut)) => {
             let sync = env.set_ghostty_shortcut(shortcut)?;
             println!("Set ghostty_shortcut = {}", env.ghostty_shortcut_display());
-            println!(
-                "Managed Ghostty keybind file: {}",
-                sync.include_path.display()
-            );
             if env.ghostty_shortcut_display() == "off" {
+                println!("Removed managed Ghostty shortcut reference from:");
+                println!("  {}", sync.config_path.display());
                 println!("Ghostty-local shortcut is now disabled.");
+                println!(
+                    "Reload Ghostty config or restart Ghostty to stop Cmd+G from typing `gtab`."
+                );
             } else {
+                println!(
+                    "Managed Ghostty keybind file: {}",
+                    sync.include_path.display()
+                );
                 println!("This shortcut types `gtab` into the focused Ghostty shell.");
                 println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
             }

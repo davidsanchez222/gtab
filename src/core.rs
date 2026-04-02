@@ -135,10 +135,7 @@ impl AppEnv {
 
     pub fn ensure_ghostty_shortcut(&self) -> Result<bool> {
         let sync = self.preview_ghostty_shortcut_sync();
-        let include_changed = self.write_ghostty_shortcut_include(&sync.include_path)?;
-        let config_changed =
-            ensure_ghostty_include_reference(&sync.config_path, &sync.include_path)?;
-        Ok(include_changed || config_changed)
+        self.sync_ghostty_shortcut_files(&sync)
     }
 
     pub fn init_shortcuts(&mut self) -> Result<GhosttyShortcutSync> {
@@ -270,9 +267,22 @@ impl AppEnv {
 
     fn sync_ghostty_shortcut(&self) -> Result<GhosttyShortcutSync> {
         let sync = self.preview_ghostty_shortcut_sync();
-        self.write_ghostty_shortcut_include(&sync.include_path)?;
-        ensure_ghostty_include_reference(&sync.config_path, &sync.include_path)?;
+        self.sync_ghostty_shortcut_files(&sync)?;
         Ok(sync)
+    }
+
+    fn sync_ghostty_shortcut_files(&self, sync: &GhosttyShortcutSync) -> Result<bool> {
+        if is_shortcut_disabled(&self.config.ghostty_shortcut) {
+            let config_changed =
+                sync_ghostty_include_reference(&sync.config_path, &sync.include_path, false)?;
+            let include_removed = remove_file_if_exists(&sync.include_path)?;
+            return Ok(config_changed || include_removed);
+        }
+
+        let include_changed = self.write_ghostty_shortcut_include(&sync.include_path)?;
+        let config_changed =
+            sync_ghostty_include_reference(&sync.config_path, &sync.include_path, true)?;
+        Ok(config_changed || include_changed)
     }
 
     fn write_ghostty_shortcut_include(&self, path: &Path) -> Result<bool> {
@@ -855,41 +865,111 @@ fn build_ghostty_shortcut_include(shortcut: &str) -> String {
     )
 }
 
-fn ensure_ghostty_include_reference(config_path: &Path, include_path: &Path) -> Result<bool> {
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+fn sync_ghostty_include_reference(
+    config_path: &Path,
+    include_path: &Path,
+    enabled: bool,
+) -> Result<bool> {
+    if enabled {
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
     }
 
-    let existing = fs::read_to_string(config_path).unwrap_or_default();
-    let include_line = format!("config-file = \"{}\"", include_path.display());
+    let existing = match fs::read_to_string(config_path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if enabled {
+                let next = render_ghostty_config_with_gtab_include(&[], include_path);
+                fs::write(config_path, next)
+                    .with_context(|| format!("failed to write {}", config_path.display()))?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
+        }
+    };
 
-    if existing.lines().any(|line| {
-        let Some((key, value)) = line.split_once('=') else {
-            return false;
-        };
+    let existing_lines: Vec<String> = existing.lines().map(str::to_string).collect();
+    let stripped_lines = strip_gtab_include_reference(&existing_lines, include_path);
+    let next = if enabled {
+        render_ghostty_config_with_gtab_include(&stripped_lines, include_path)
+    } else {
+        render_ghostty_config(&stripped_lines)
+    };
 
-        key.trim() == "config-file"
-            && value.trim().trim_matches('"') == include_path.display().to_string()
-    }) {
+    if next == existing {
         return Ok(false);
     }
 
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
+    fs::write(config_path, next)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(true)
+}
+
+fn strip_gtab_include_reference(lines: &[String], include_path: &Path) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    let mut index = 0;
+
+    while index < lines.len() {
+        if is_gtab_include_reference_line(&lines[index], include_path) {
+            if kept.last().map(|line| line.trim()) == Some("# gtab managed include") {
+                kept.pop();
+            }
+            if kept.last().is_some_and(|line| line.trim().is_empty()) {
+                kept.pop();
+            }
+            index += 1;
+            continue;
+        }
+
+        kept.push(lines[index].clone());
+        index += 1;
     }
+
+    kept
+}
+
+fn render_ghostty_config_with_gtab_include(lines: &[String], include_path: &Path) -> String {
+    let mut next = render_ghostty_config(lines);
 
     if !next.is_empty() {
         next.push('\n');
     }
 
     next.push_str("# gtab managed include\n");
-    next.push_str(&include_line);
-    next.push('\n');
+    next.push_str(&format!("config-file = \"{}\"\n", include_path.display()));
+    next
+}
 
-    fs::write(config_path, next)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+fn render_ghostty_config(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    rendered
+}
+
+fn is_gtab_include_reference_line(line: &str, include_path: &Path) -> bool {
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+
+    key.trim() == "config-file"
+        && value.trim().trim_matches('"') == include_path.display().to_string()
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
     Ok(true)
 }
 
@@ -1005,7 +1085,7 @@ pub fn format_settings(env: &AppEnv) -> String {
 mod tests {
     use super::{
         Config, TabRow, apple_escape, build_ghostty_shortcut_include, build_workspace_script,
-        parse_workspace_tabs, should_switch_to_ascii_input_source,
+        parse_workspace_tabs, should_switch_to_ascii_input_source, sync_ghostty_include_reference,
     };
 
     #[test]
@@ -1138,6 +1218,93 @@ end tell
         let include = build_ghostty_shortcut_include("off");
         assert!(!include.contains("keybind ="));
         assert!(include.contains("Ghostty-local shortcut is disabled"));
+    }
+
+    #[test]
+    fn enabling_ghostty_sync_adds_managed_include_reference() {
+        let config_path = tempfile_path("ghostty-config-enable");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+
+        let changed = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "# gtab managed include\nconfig-file = \"/tmp/gtab-shortcut.conf\"\n"
+        );
+    }
+
+    #[test]
+    fn enabling_ghostty_sync_is_idempotent() {
+        let config_path = tempfile_path("ghostty-config-idempotent");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+
+        sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+        let changed = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+
+        assert!(!changed);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "# gtab managed include\nconfig-file = \"/tmp/gtab-shortcut.conf\"\n"
+        );
+    }
+
+    #[test]
+    fn enabling_ghostty_sync_deduplicates_existing_managed_reference() {
+        let config_path = tempfile_path("ghostty-config-dedupe");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+        std::fs::write(
+            &config_path,
+            concat!(
+                "font-size = 15\n\n",
+                "# gtab managed include\n",
+                "config-file = \"/tmp/gtab-shortcut.conf\"\n\n",
+                "# gtab managed include\n",
+                "config-file = \"/tmp/gtab-shortcut.conf\"\n"
+            ),
+        )
+        .unwrap();
+
+        let changed = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            concat!(
+                "font-size = 15\n\n",
+                "# gtab managed include\n",
+                "config-file = \"/tmp/gtab-shortcut.conf\"\n"
+            )
+        );
+    }
+
+    #[test]
+    fn disabling_ghostty_sync_removes_managed_include_and_preserves_other_config() {
+        let config_path = tempfile_path("ghostty-config-disable");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+        std::fs::write(
+            &config_path,
+            concat!(
+                "theme = dark\n",
+                "config-file = \"/tmp/shared.conf\"\n\n",
+                "# gtab managed include\n",
+                "config-file = \"/tmp/gtab-shortcut.conf\"\n",
+                "shell-integration = zsh"
+            ),
+        )
+        .unwrap();
+
+        let changed = sync_ghostty_include_reference(&config_path, include_path, false).unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            concat!(
+                "theme = dark\n",
+                "config-file = \"/tmp/shared.conf\"\n",
+                "shell-integration = zsh\n"
+            )
+        );
     }
 
     fn tempfile_path(name: &str) -> std::path::PathBuf {

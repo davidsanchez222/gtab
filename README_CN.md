@@ -76,6 +76,8 @@ gtab init
 gtab set ghostty_shortcut off
 ```
 
+然后重新加载 Ghostty 配置，或者直接重启 Ghostty，这样 `Cmd+G` 才不会继续向当前 shell 输入 `gtab`。
+
 删除已安装的二进制：
 
 ```bash
@@ -88,7 +90,7 @@ brew uninstall gtab
 cargo uninstall gtab
 ```
 
-如果你还想一并删除保存的 workspace 和本地配置，再删除：
+等 Ghostty 已经重新加载、且不再引用 gtab 托管的快捷键配置后，如果你还想一并删除保存的 workspace 和本地配置，再删除：
 
 ```bash
 rm -rf ~/.config/gtab

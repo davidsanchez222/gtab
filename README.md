@@ -76,6 +76,8 @@ Disable the Ghostty-local shortcut:
 gtab set ghostty_shortcut off
 ```
 
+Then reload Ghostty config or restart Ghostty so `Cmd+G` stops sending `gtab` to the current shell.
+
 Remove the installed binary:
 
 ```bash
@@ -88,7 +90,7 @@ or:
 cargo uninstall gtab
 ```
 
-If you also want to remove saved workspaces and local config, delete:
+After Ghostty has reloaded without the managed shortcut include, you can also remove saved workspaces and local config:
 
 ```bash
 rm -rf ~/.config/gtab
