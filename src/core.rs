@@ -2,14 +2,20 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, c_void};
 use std::{
+    collections::BTreeSet,
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 const APPLE_EXT: &str = "applescript";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "cmd+g";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
+const GHOSTTY_DISCOVERY_ATTEMPTS: usize = 100;
+const GHOSTTY_DISCOVERY_DELAY_MS: u64 = 50;
 const LEGACY_LAUNCHER_SCRIPT_NAME: &str = "launcher.sh";
 const LEGACY_HOTKEY_SERVICE_LABEL: &str = "com.franvy.gtab.hotkey";
 const LEGACY_HOTKEY_PLIST_NAME: &str = "com.franvy.gtab.hotkey.plist";
@@ -74,6 +80,14 @@ pub struct Workspace {
     pub name: String,
     pub path: PathBuf,
     pub tabs: Vec<WorkspaceTab>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowFrame {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Debug)]
@@ -184,13 +198,9 @@ impl AppEnv {
 
     pub fn save_current_window(&self, name: &str) -> Result<PathBuf> {
         let path = self.workspace_path(name)?;
-        let rows = capture_ghostty_tabs()?;
-        if rows.is_empty() {
-            bail!("could not read Ghostty tabs (make sure Ghostty is the frontmost app)");
-        }
-
-        let script = build_workspace_script(&rows);
-        fs::write(&path, script).with_context(|| format!("failed to write {}", path.display()))?;
+        let script = capture_workspace_script()?;
+        fs::write(&path, &script)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
 
@@ -213,6 +223,31 @@ impl AppEnv {
         Ok(())
     }
 
+    pub fn rename_workspace(&self, old_name: &str, new_name: &str) -> Result<PathBuf> {
+        let old_path = self.workspace_path(old_name)?;
+        if !old_path.exists() {
+            bail!("workspace '{old_name}' not found");
+        }
+
+        if old_name == new_name {
+            return Ok(old_path);
+        }
+
+        let new_path = self.workspace_path(new_name)?;
+        if new_path.exists() {
+            bail!("workspace '{new_name}' already exists");
+        }
+
+        fs::rename(&old_path, &new_path).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                old_path.display(),
+                new_path.display()
+            )
+        })?;
+        Ok(new_path)
+    }
+
     pub fn remove_workspace(&self, name: &str) -> Result<PathBuf> {
         let path = self.workspace_path(name)?;
         if !path.exists() {
@@ -229,20 +264,58 @@ impl AppEnv {
             bail!("workspace '{name}' not found");
         }
 
-        let status = Command::new("osascript")
-            .arg(&path)
-            .status()
-            .with_context(|| format!("failed to run {}", path.display()))?;
-
-        if !status.success() {
-            bail!("workspace launch failed");
-        }
-
-        if self.config.close_tab {
-            hup_parent_process()?;
-        }
-
+        self.launch_workspace_script_path(&path)?;
+        self.finish_workspace_launch()?;
         Ok(())
+    }
+
+    pub fn launch_workspace_from_tui_with_frame(
+        &self,
+        name: &str,
+        frame: &WindowFrame,
+    ) -> Result<Option<String>> {
+        let path = self.workspace_path(name)?;
+        if !path.exists() {
+            bail!("workspace '{name}' not found");
+        }
+
+        let script = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        if workspace_requires_true_legacy_launch(&script) {
+            self.launch_workspace_script_path(&path)?;
+            self.finish_workspace_launch()?;
+            return Ok(Some(
+                "workspace launched without frame sync; saved AppleScript uses unsupported custom configuration".to_string(),
+            ));
+        }
+
+        if workspace_has_splits(&script) {
+            let existing_window_ids = ghostty_window_ids()?;
+            self.launch_workspace_script_path(&path)?;
+            if let Ok(window_id) = wait_for_new_ghostty_window_id(&existing_window_ids) {
+                let _ = reposition_ghostty_window(&window_id, frame);
+            }
+            self.finish_workspace_launch()?;
+            return Ok(None);
+        }
+
+        let rows = parse_workspace_rows(&script);
+        if rows.is_empty() {
+            self.launch_workspace_script_path(&path)?;
+            self.finish_workspace_launch()?;
+            return Ok(Some(
+                "workspace launched without frame sync; saved AppleScript could not be reconstructed".to_string(),
+            ));
+        }
+
+        launch_workspace_rows_in_background(&rows, frame)?;
+        self.finish_workspace_launch()?;
+        Ok(None)
+    }
+
+    pub fn capture_frontmost_ghostty_window_frame(&self) -> Result<WindowFrame> {
+        capture_ghostty_window_frame()
     }
 
     pub fn close_tab_display(&self) -> &'static str {
@@ -251,6 +324,33 @@ impl AppEnv {
 
     pub fn ghostty_shortcut_display(&self) -> &str {
         &self.config.ghostty_shortcut
+    }
+
+    fn launch_workspace_script_path(&self, path: &Path) -> Result<()> {
+        let output = Command::new("osascript")
+            .arg(path)
+            .output()
+            .with_context(|| format!("failed to run {}", path.display()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                bail!("workspace launch failed");
+            } else {
+                bail!("workspace launch failed: {msg}");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish_workspace_launch(&self) -> Result<()> {
+        if self.config.close_tab {
+            hup_parent_process()?;
+        }
+
+        Ok(())
     }
 
     pub fn preview_ghostty_shortcut_sync(&self) -> GhosttyShortcutSync {
@@ -655,56 +755,181 @@ fn is_shortcut_disabled(shortcut: &str) -> bool {
     matches!(shortcut.trim(), "off" | "none" | "disabled")
 }
 
-fn capture_ghostty_tabs() -> Result<Vec<TabRow>> {
-    let output = run_osascript(
-        r#"set rows to {}
+fn capture_workspace_script() -> Result<String> {
+    // Phase 1: read all tabs/panes; for multi-pane tabs also capture AX screen positions
+    let raw = run_osascript(
+        r#"set D to (ASCII character 9)
 tell application "Ghostty"
   set win to front window
-  set n to count of tabs of win
-  repeat with i from 1 to n
-    set t to tab i of win
-    set surf to focused terminal of t
-    try
-      set wd to working directory of surf
-    on error
-      set wd to ""
-    end try
+  set tabList to tabs of win
+  set allLines to {}
+  repeat with ti from 1 to count of tabList
+    set t to item ti of tabList
+    set termList to every terminal of t
     set ttl to name of t
     if ttl starts with "⠐ " then set ttl to text 3 thru -1 of ttl
-    set end of rows to (wd & "	" & ttl)
+    if (count of termList) = 1 then
+      set term to item 1 of termList
+      set wd to working directory of term
+      if wd = "" then set wd to POSIX path of (path to home folder)
+      set end of allLines to (ti as text) & D & "1" & D & (id of term as text) & D & wd & D & ttl & D & "0,0,1,1"
+    else
+      repeat with pi from 1 to count of termList
+        set term to item pi of termList
+        set wd to working directory of term
+        if wd = "" then set wd to POSIX path of (path to home folder)
+        focus term
+        delay 0.12
+        set posStr to "0,0,1,1"
+        tell application "System Events"
+          try
+            set gProc to application process "Ghostty"
+            set fe to value of attribute "AXFocusedUIElement" of gProc
+            repeat 8 times
+              if role of fe = "AXScrollArea" then exit repeat
+              set fe to value of attribute "AXParent" of fe
+            end repeat
+            set pos to position of fe
+            set sz to size of fe
+            set posStr to ((item 1 of pos) as text) & "," & ((item 2 of pos) as text) & "," & ((item 1 of sz) as text) & "," & ((item 2 of sz) as text)
+          end try
+        end tell
+        set end of allLines to (ti as text) & D & (pi as text) & D & (id of term as text) & D & wd & D & ttl & D & posStr
+      end repeat
+    end if
   end repeat
-end tell
-set AppleScript's text item delimiters to linefeed
-return rows as text"#,
+  set AppleScript's text item delimiters to linefeed
+  return allLines as text
+end tell"#,
     )
     .context("could not read Ghostty tabs (make sure Ghostty is the frontmost app)")?;
 
-    let home = home_dir()
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .into_os_string()
-        .into_string()
-        .unwrap_or_else(|_| "/".to_string());
+    if raw.trim().is_empty() {
+        bail!("could not read Ghostty tabs (make sure Ghostty is the frontmost app)");
+    }
 
-    let rows = output
-        .lines()
-        .map(|line| {
-            let mut parts = line.splitn(2, '\t');
-            let working_dir = parts.next().unwrap_or("").trim().to_string();
-            let title = parts.next().unwrap_or("").trim().to_string();
-            TabRow {
-                working_dir: if working_dir.is_empty() {
-                    home.clone()
-                } else {
-                    working_dir
-                },
-                title,
-            }
-        })
-        .collect();
+    // Phase 2: reconstruct split trees from positions and generate restore script
+    let py = r#"import sys
+from collections import defaultdict
 
-    Ok(rows)
+def esc(s):
+    return s.replace('\\', '\\\\').replace('"', '\\"')
+
+def get_anchor(tree):
+    if tree['t'] == 'leaf': return tree['p']
+    if tree['t'] == 'v':    return get_anchor(tree['l'])
+    return get_anchor(tree['T'])
+
+def reconstruct(panes):
+    if len(panes) == 1:
+        return {'t': 'leaf', 'p': panes[0]}
+    for sx in sorted(set(p['x'] + p['w'] for p in panes)):
+        L = [p for p in panes if p['x'] + p['w'] <= sx + 2]
+        R = [p for p in panes if p['x'] >= sx - 2]
+        if L and R and len(L) + len(R) == len(panes):
+            return {'t': 'v', 'l': reconstruct(L), 'r': reconstruct(R)}
+    for sy in sorted(set(p['y'] + p['h'] for p in panes)):
+        T = [p for p in panes if p['y'] + p['h'] <= sy + 2]
+        B = [p for p in panes if p['y'] >= sy - 2]
+        if T and B and len(T) + len(B) == len(panes):
+            return {'t': 'h', 'T': reconstruct(T), 'B': reconstruct(B)}
+    return {'t': 'leaf', 'p': panes[0]}
+
+def gen(tree, var, lines, c):
+    if tree['t'] == 'leaf': return c
+    if tree['t'] == 'v':
+        a = get_anchor(tree['r'])
+        lines += [
+            '',
+            f"    set cfg{c} to new surface configuration",
+            f'    set initial working directory of cfg{c} to "{esc(a["wd"])}"',
+            f"    set p{c} to split {var} direction right with configuration cfg{c}"
+        ]
+        rv, c = f"p{c}", c + 1
+        c = gen(tree['l'], var, lines, c)
+        c = gen(tree['r'], rv, lines, c)
+    else:
+        a = get_anchor(tree['B'])
+        lines += [
+            '',
+            f"    set cfg{c} to new surface configuration",
+            f'    set initial working directory of cfg{c} to "{esc(a["wd"])}"',
+            f"    set p{c} to split {var} direction down with configuration cfg{c}"
+        ]
+        bv, c = f"p{c}", c + 1
+        c = gen(tree['T'], var, lines, c)
+        c = gen(tree['B'], bv, lines, c)
+    return c
+
+tabs = defaultdict(lambda: {'title': '', 'panes': []})
+for line in sys.stdin:
+    parts = line.rstrip('\n').split('\t')
+    if len(parts) < 6: continue
+    ti, wd, title, pos = int(parts[0]), parts[3], parts[4], parts[5]
+    try: x, y, w, h = map(int, pos.split(','))
+    except ValueError: x, y, w, h = 0, 0, 1, 1
+    tabs[ti]['title'] = title
+    tabs[ti]['panes'].append({'x': x, 'y': y, 'w': w, 'h': h, 'wd': wd})
+
+out = ['tell application "Ghostty"', '    activate']
+c = 1
+for i, ti in enumerate(sorted(tabs.keys())):
+    tab = tabs[ti]
+    tree = reconstruct(tab['panes'])
+    anchor = get_anchor(tree)
+    out += [
+        '',
+        f"    set cfg{c} to new surface configuration",
+        f'    set initial working directory of cfg{c} to "{esc(anchor["wd"])}"'
+    ]
+    if i == 0:
+        out += [
+            f"    set win to new window with configuration cfg{c}",
+            f"    set p{c} to focused terminal of selected tab of win"
+        ]
+    else:
+        out += [
+            f"    set newtab{i} to new tab in win with configuration cfg{c}",
+            f"    set p{c} to focused terminal of newtab{i}"
+        ]
+    fv, c = f"p{c}", c + 1
+    if tab['title']:
+        out.append(f'    perform action "set_tab_title:{esc(tab["title"])}" on {fv}')
+    c = gen(tree, fv, out, c)
+
+out.append('end tell')
+print('\n'.join(out))
+"#;
+
+    let mut child = Command::new("python3")
+        .arg("-c")
+        .arg(py)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn python3 for workspace script generation")?;
+
+    {
+        let stdin = child.stdin.as_mut().context("failed to open python3 stdin")?;
+        stdin
+            .write_all(raw.as_bytes())
+            .context("failed to write tab data to python3")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for python3")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("failed to generate workspace script: {stderr}");
+    }
+
+    String::from_utf8(output.stdout).context("python3 output was not valid UTF-8")
 }
 
+#[cfg(test)]
 fn build_workspace_script(rows: &[TabRow]) -> String {
     let mut out = String::from("tell application \"Ghostty\"\n    activate");
 
@@ -743,7 +968,262 @@ fn build_workspace_script(rows: &[TabRow]) -> String {
     out
 }
 
+fn launch_workspace_rows_in_background(rows: &[TabRow], frame: &WindowFrame) -> Result<()> {
+    let Some(first_row) = rows.first() else {
+        bail!("workspace has no tabs to launch");
+    };
+
+    let existing_window_ids = ghostty_window_ids()?;
+
+    create_ghostty_window_via_applescript(first_row)?;
+    let window_id = wait_for_new_ghostty_window_id(&existing_window_ids)?;
+
+    reposition_ghostty_window(&window_id, frame)?;
+
+    if let Some(script) = build_workspace_followup_script(&window_id, rows) {
+        run_osascript(&script).context("failed to finish restoring the workspace tabs")?;
+    }
+
+    activate_ghostty_window(&window_id)?;
+    Ok(())
+}
+
+fn create_ghostty_window_via_applescript(first_row: &TabRow) -> Result<()> {
+    let script = format!(
+        "tell application \"Ghostty\"\n    set cfg to new surface configuration\n    set initial working directory of cfg to \"{wd}\"\n    set win to new window with configuration cfg\nend tell",
+        wd = apple_escape(&first_row.working_dir)
+    );
+    run_osascript(&script).context("failed to create a new Ghostty window")?;
+    Ok(())
+}
+
+fn reposition_ghostty_window(window_id: &str, frame: &WindowFrame) -> Result<()> {
+    let script = format!(
+        r#"tell application "System Events"
+  tell process "Ghostty"
+    set matchingWindow to missing value
+    repeat with candidate in windows
+      try
+        if value of attribute "AXIdentifier" of candidate is "{id}" then
+          set matchingWindow to candidate
+          exit repeat
+        end if
+      end try
+    end repeat
+    if matchingWindow is missing value then
+      if (count of windows) is 0 then error "Ghostty has no visible window"
+      set matchingWindow to window 1
+    end if
+    set position of matchingWindow to {{{x}, {y}}}
+    set size of matchingWindow to {{{w}, {h}}}
+  end tell
+end tell"#,
+        id = apple_escape(window_id),
+        x = frame.x,
+        y = frame.y,
+        w = frame.width,
+        h = frame.height
+    );
+    run_osascript(&script).context(
+        "failed to reposition the Ghostty window (check Accessibility permissions)",
+    )?;
+    Ok(())
+}
+
+fn ghostty_window_ids() -> Result<BTreeSet<String>> {
+    let output = run_osascript(
+        r#"set rows to {}
+tell application "Ghostty"
+  repeat with win in windows
+    set end of rows to id of win
+  end repeat
+end tell
+set AppleScript's text item delimiters to linefeed
+return rows as text"#,
+    )
+    .context("failed to query Ghostty windows")?;
+
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn wait_for_new_ghostty_window_id(existing_window_ids: &BTreeSet<String>) -> Result<String> {
+    for _ in 0..GHOSTTY_DISCOVERY_ATTEMPTS {
+        let current_window_ids = ghostty_window_ids()?;
+        if let Some(window_id) = current_window_ids
+            .iter()
+            .find(|window_id| !existing_window_ids.contains(*window_id))
+        {
+            return Ok(window_id.clone());
+        }
+
+        thread::sleep(Duration::from_millis(GHOSTTY_DISCOVERY_DELAY_MS));
+    }
+
+    bail!("timed out waiting for the new Ghostty window")
+}
+
+fn capture_ghostty_window_frame() -> Result<WindowFrame> {
+    let output = run_osascript(
+        r#"tell application "System Events"
+  tell process "Ghostty"
+    set targetWindow to missing value
+    repeat with candidate in windows
+      try
+        if value of attribute "AXMain" of candidate is true then
+          set targetWindow to candidate
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetWindow is missing value then
+      if (count of windows) is 0 then error "Ghostty has no visible window"
+      set targetWindow to window 1
+    end if
+    set {xPos, yPos} to position of targetWindow
+    set {winWidth, winHeight} to size of targetWindow
+    return (xPos as text) & tab & (yPos as text) & tab & (winWidth as text) & tab & (winHeight as text)
+  end tell
+end tell"#,
+    )
+    .context(
+        "failed to read the current Ghostty window frame via System Events (check Accessibility permissions)",
+    )?;
+
+    parse_window_frame(&output)
+}
+
+
+fn build_workspace_followup_script(window_id: &str, rows: &[TabRow]) -> Option<String> {
+    let first_row = rows.first()?;
+    let has_extra_tabs = rows.len() > 1;
+    let has_first_title = !first_row.title.is_empty();
+    if !has_extra_tabs && !has_first_title {
+        return None;
+    }
+
+    let mut out = format!(
+        "tell application \"Ghostty\"\n    set matchingWindows to every window whose id is \"{}\"\n    if (count of matchingWindows) is 0 then error \"Ghostty window not found after launch\"\n    set win to item 1 of matchingWindows",
+        apple_escape(window_id)
+    );
+
+    if has_first_title {
+        out.push_str("\n    set term1 to focused terminal of selected tab of win");
+        out.push_str(&format!(
+            "\n    perform action \"set_tab_title:{}\" on term1",
+            apple_escape(&first_row.title)
+        ));
+    }
+
+    for (index, row) in rows.iter().enumerate().skip(1) {
+        let n = index + 1;
+        out.push_str("\n\n");
+        out.push_str(&format!("    set cfg{n} to new surface configuration\n"));
+        out.push_str(&format!(
+            "    set initial working directory of cfg{n} to \"{}\"\n",
+            apple_escape(&row.working_dir)
+        ));
+        out.push_str(&format!(
+            "    set tab{n} to new tab in win with configuration cfg{n}\n"
+        ));
+        out.push_str(&format!("    set term{n} to focused terminal of tab{n}"));
+        if !row.title.is_empty() {
+            out.push_str(&format!(
+                "\n    perform action \"set_tab_title:{}\" on term{n}",
+                apple_escape(&row.title)
+            ));
+        }
+    }
+
+    out.push_str("\nend tell\n");
+    Some(out)
+}
+
+fn activate_ghostty_window(window_id: &str) -> Result<()> {
+    let script = format!(
+        r#"tell application "Ghostty"
+  set matchingWindows to every window whose id is "{}"
+  if (count of matchingWindows) is 0 then error "Ghostty window not found after launch"
+  activate window (item 1 of matchingWindows)
+end tell"#,
+        apple_escape(window_id)
+    );
+
+    run_osascript(&script).context("failed to activate the launched Ghostty window")?;
+    Ok(())
+}
+
+fn parse_window_frame(raw: &str) -> Result<WindowFrame> {
+    let parts: Vec<&str> = raw.trim().split('\t').map(str::trim).collect();
+    if parts.len() != 4 {
+        bail!("could not parse Ghostty window frame");
+    }
+
+    let x = parts[0]
+        .parse::<i32>()
+        .context("could not parse Ghostty window frame x position")?;
+    let y = parts[1]
+        .parse::<i32>()
+        .context("could not parse Ghostty window frame y position")?;
+    let width = parts[2]
+        .parse::<i32>()
+        .context("could not parse Ghostty window frame width")?;
+    let height = parts[3]
+        .parse::<i32>()
+        .context("could not parse Ghostty window frame height")?;
+
+    if width <= 0 || height <= 0 {
+        bail!("Ghostty window frame size must be positive");
+    }
+
+    Ok(WindowFrame {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn parse_workspace_rows(script: &str) -> Vec<TabRow> {
+    let home = home_dir()
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .into_os_string()
+        .into_string()
+        .unwrap_or_else(|_| "/".to_string());
+
+    parsed_workspace_tabs(script)
+        .into_iter()
+        .map(|tab| TabRow {
+            working_dir: tab
+                .working_dir
+                .filter(|working_dir| !working_dir.is_empty())
+                .unwrap_or_else(|| home.clone()),
+            title: tab.title.unwrap_or_default(),
+        })
+        .collect()
+}
+
 fn parse_workspace_tabs(script: &str) -> Vec<WorkspaceTab> {
+    parsed_workspace_tabs(script)
+        .into_iter()
+        .enumerate()
+        .map(|(index, tab)| WorkspaceTab {
+            title: match tab.title.filter(|title| !title.is_empty()) {
+                Some(title) => title,
+                None => fallback_tab_name(index + 1, tab.working_dir.as_deref()),
+            },
+            working_dir: tab
+                .working_dir
+                .filter(|working_dir| !working_dir.is_empty()),
+        })
+        .collect()
+}
+
+fn parsed_workspace_tabs(script: &str) -> Vec<ParsedWorkspaceTab> {
     let mut tabs: Vec<ParsedWorkspaceTab> = Vec::new();
 
     for line in script.lines() {
@@ -763,18 +1243,24 @@ fn parse_workspace_tabs(script: &str) -> Vec<WorkspaceTab> {
         }
     }
 
-    tabs.into_iter()
-        .enumerate()
-        .map(|(index, tab)| WorkspaceTab {
-            title: match tab.title.filter(|title| !title.is_empty()) {
-                Some(title) => title,
-                None => fallback_tab_name(index + 1, tab.working_dir.as_deref()),
-            },
-            working_dir: tab
-                .working_dir
-                .filter(|working_dir| !working_dir.is_empty()),
-        })
-        .collect()
+    tabs
+}
+
+fn workspace_requires_true_legacy_launch(script: &str) -> bool {
+    script.lines().map(str::trim).any(|line| {
+        line.starts_with("set command of cfg")
+            || line.starts_with("set initial input of cfg")
+            || line.starts_with("set wait after command of cfg")
+            || line.starts_with("set environment variables of cfg")
+    })
+}
+
+fn workspace_has_splits(script: &str) -> bool {
+    script.lines().map(str::trim).any(|line| {
+        line.starts_with("set p")
+            && line.contains(" split ")
+            && line.contains(" direction ")
+    })
 }
 
 fn parse_indexed_assignment(line: &str, prefix: &str, marker: &str) -> Option<(usize, String)> {
@@ -1084,9 +1570,23 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, TabRow, apple_escape, build_ghostty_shortcut_include, build_workspace_script,
-        parse_workspace_tabs, should_switch_to_ascii_input_source, sync_ghostty_include_reference,
+        AppEnv, Config, TabRow, WindowFrame, apple_escape, build_ghostty_shortcut_include,
+        build_workspace_followup_script, build_workspace_script,
+        parse_window_frame, parse_workspace_rows, parse_workspace_tabs,
+        should_switch_to_ascii_input_source, sync_ghostty_include_reference,
+        workspace_has_splits, workspace_requires_true_legacy_launch,
     };
+    use std::path::PathBuf;
+
+    fn test_env(name: &str) -> AppEnv {
+        let base_dir = tempfile_path(name);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        AppEnv {
+            config_file: base_dir.join("config"),
+            base_dir,
+            config: Config::default(),
+        }
+    }
 
     #[test]
     fn config_parses_close_tab_truthy_values() {
@@ -1207,6 +1707,144 @@ end tell
     }
 
     #[test]
+    fn workspace_rows_preserve_empty_titles_for_relaunch() {
+        let rows = parse_workspace_rows(
+            r#"tell application "Ghostty"
+    activate
+
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set win to new window with configuration cfg1
+    set term1 to focused terminal of selected tab of win
+
+    set cfg2 to new surface configuration
+    set initial working directory of cfg2 to "/tmp/work"
+    set tab2 to new tab in win with configuration cfg2
+    set term2 to focused terminal of tab2
+end tell
+"#,
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].working_dir, "/tmp/project");
+        assert!(rows[0].title.is_empty());
+        assert_eq!(rows[1].working_dir, "/tmp/work");
+        assert!(rows[1].title.is_empty());
+    }
+
+    #[test]
+    fn workspace_followup_script_targets_specific_window_and_skips_empty_titles() {
+        let script = build_workspace_followup_script(
+            "ghostty-window-123",
+            &[
+                TabRow {
+                    working_dir: "/tmp/demo".to_string(),
+                    title: String::new(),
+                },
+                TabRow {
+                    working_dir: "/tmp/api".to_string(),
+                    title: "api".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(script.contains("every window whose id is \"ghostty-window-123\""));
+        assert!(!script.contains("set_tab_title:\" on term1"));
+        assert!(script.contains("set initial working directory of cfg2 to \"/tmp/api\""));
+        assert!(script.contains("set_tab_title:api"));
+    }
+
+    #[test]
+    fn custom_workspace_features_require_legacy_launch() {
+        assert!(workspace_requires_true_legacy_launch(
+            r#"tell application "Ghostty"
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set command of cfg1 to "npm run dev"
+end tell"#
+        ));
+
+        assert!(!workspace_requires_true_legacy_launch(
+            r#"tell application "Ghostty"
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+end tell"#
+        ));
+    }
+
+    #[test]
+    fn split_workspace_detected_correctly() {
+        assert!(workspace_has_splits(
+            r#"tell application "Ghostty"
+    set p1 to split p0 direction right with configuration cfg2
+end tell"#
+        ));
+
+        assert!(!workspace_has_splits(
+            r#"tell application "Ghostty"
+    set newtab1 to new tab in win with configuration cfg2
+end tell"#
+        ));
+
+        // split workspaces are not treated as "true legacy"
+        assert!(!workspace_requires_true_legacy_launch(
+            r#"tell application "Ghostty"
+    set p1 to split p0 direction right with configuration cfg2
+end tell"#
+        ));
+    }
+
+    #[test]
+    fn parse_window_frame_reads_tab_separated_numbers() {
+        let frame = parse_window_frame("40\t80\t1440\t900").unwrap();
+
+        assert_eq!(
+            frame,
+            WindowFrame {
+                x: 40,
+                y: 80,
+                width: 1440,
+                height: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn rename_workspace_renames_applescript_file() {
+        let env = test_env("rename-workspace");
+        let old_path = env.base_dir.join("alpha.applescript");
+        let new_path = env.base_dir.join("beta.applescript");
+        std::fs::write(&old_path, "tell application \"Ghostty\"\nend tell\n").unwrap();
+
+        let renamed = env.rename_workspace("alpha", "beta").unwrap();
+
+        assert_eq!(renamed, new_path);
+        assert!(!old_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&renamed).unwrap(),
+            "tell application \"Ghostty\"\nend tell\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn rename_workspace_rejects_existing_destination() {
+        let env = test_env("rename-workspace-conflict");
+        std::fs::write(env.base_dir.join("alpha.applescript"), "alpha").unwrap();
+        std::fs::write(env.base_dir.join("beta.applescript"), "beta").unwrap();
+
+        let error = env
+            .rename_workspace("alpha", "beta")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("workspace 'beta' already exists"));
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
     fn ghostty_shortcut_include_writes_keybind_command() {
         let include = build_ghostty_shortcut_include("cmd+g");
         assert!(include.contains("Default Ghostty-local shortcut"));
@@ -1307,7 +1945,7 @@ end tell
         );
     }
 
-    fn tempfile_path(name: &str) -> std::path::PathBuf {
+    fn tempfile_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

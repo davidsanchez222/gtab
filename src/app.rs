@@ -4,8 +4,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -26,8 +25,8 @@ use std::{
 };
 
 const DOUBLE_CLICK_MS: u64 = 350;
-const MIN_WIDTH: u16 = 80;
-const MIN_HEIGHT: u16 = 22;
+const MIN_WIDTH: u16 = 52;
+const MIN_HEIGHT: u16 = 15;
 const MAIN_LIST_WIDTH: u16 = 24;
 
 pub fn run_tui(env: &mut AppEnv) -> Result<()> {
@@ -78,8 +77,12 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                         Err(error) => app.set_error(error.to_string()),
                     },
                     Action::Launch(name) => {
-                        launch_workspace_from_tui(&mut terminal, env, &name)?;
-                        break;
+                        let warning = launch_workspace_from_tui(&mut terminal, env, &name)?;
+                        drop(terminal);
+                        if let Some(warning) = warning {
+                            eprintln!("warning: {warning}");
+                        }
+                        return Ok(());
                     }
                     Action::Save(name) => {
                         terminal.suspend()?;
@@ -94,6 +97,19 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                                 app.set_success(format!(
                                     "Saved workspace \"{name}\" to {}",
                                     display_path(&path)
+                                ));
+                            }
+                            Err(error) => app.set_error(error.to_string()),
+                        }
+                    }
+                    Action::Rename(old_name, new_name) => {
+                        match env.rename_workspace(&old_name, &new_name) {
+                            Ok(_) => {
+                                app.reset_dialogs();
+                                app.reload(env.list_workspaces()?);
+                                app.select_name(&new_name);
+                                app.set_success(format!(
+                                    "Renamed workspace \"{old_name}\" to \"{new_name}\""
                                 ));
                             }
                             Err(error) => app.set_error(error.to_string()),
@@ -151,8 +167,12 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
             Event::Mouse(mouse) => match app.handle_mouse(mouse, env)? {
                 Action::None => {}
                 Action::Launch(name) => {
-                    launch_workspace_from_tui(&mut terminal, env, &name)?;
-                    break;
+                    let warning = launch_workspace_from_tui(&mut terminal, env, &name)?;
+                    drop(terminal);
+                    if let Some(warning) = warning {
+                        eprintln!("warning: {warning}");
+                    }
+                    return Ok(());
                 }
                 _ => {}
             },
@@ -167,14 +187,26 @@ fn launch_workspace_from_tui(
     terminal: &mut TerminalSession,
     env: &AppEnv,
     name: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
+    let (frame, pending_warning) = match env.capture_frontmost_ghostty_window_frame() {
+        Ok(frame) => (Some(frame), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "workspace launched without frame sync; gtab could not read the current Ghostty window frame: {error}"
+            )),
+        ),
+    };
+
     terminal.suspend()?;
 
-    match env.launch_workspace(name) {
-        Ok(()) => {
-            terminal.resume()?;
-            Ok(())
-        }
+    let result = match frame {
+        Some(frame) => env.launch_workspace_from_tui_with_frame(name, &frame),
+        None => env.launch_workspace(name).map(|()| None),
+    };
+
+    match result {
+        Ok(warning) => Ok(warning.or(pending_warning)),
         Err(error) => {
             terminal.resume()?;
             Err(error)
@@ -184,6 +216,7 @@ fn launch_workspace_from_tui(
 
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    suspended: bool,
 }
 
 impl TerminalSession {
@@ -194,13 +227,15 @@ impl TerminalSession {
             stdout,
             EnterAlternateScreen,
             EnableMouseCapture,
-            PushKeyboardEnhancementFlags(keyboard_enhancement_flags()),
             Hide
         )
         .context("failed to enter alternate screen")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
             .context("failed to initialize terminal backend")?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            suspended: false,
+        })
     }
 
     fn draw(&mut self, f: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
@@ -209,16 +244,23 @@ impl TerminalSession {
     }
 
     fn suspend(&mut self) -> Result<()> {
+        // Drain any buffered terminal events (e.g. mouse button release) before
+        // disabling raw mode. Without this, the release bytes can leak into the
+        // shell's input buffer and appear as visible text (e.g. "0;9;4m").
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let _ = event::read();
+        }
+
         disable_raw_mode().context("failed to disable raw mode")?;
         execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
             Show
         )
         .context("failed to leave alternate screen")?;
         self.terminal.show_cursor().ok();
+        self.suspended = true;
         Ok(())
     }
 
@@ -227,24 +269,26 @@ impl TerminalSession {
             self.terminal.backend_mut(),
             EnterAlternateScreen,
             EnableMouseCapture,
-            PushKeyboardEnhancementFlags(keyboard_enhancement_flags()),
             Hide
         )
         .context("failed to re-enter alternate screen")?;
         enable_raw_mode().context("failed to re-enable raw mode")?;
         self.terminal.clear().ok();
+        self.suspended = false;
         Ok(())
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.suspended {
+            return;
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
             LeaveAlternateScreen,
             DisableMouseCapture,
-            PopKeyboardEnhancementFlags,
             Show
         );
         let _ = self.terminal.show_cursor();
@@ -255,6 +299,7 @@ impl Drop for TerminalSession {
 enum Dialog {
     None,
     Save,
+    Rename,
     ConfirmDelete,
     Settings,
     EditGhosttyShortcut,
@@ -292,6 +337,8 @@ struct App {
     search_before_edit: Option<String>,
     dialog: Dialog,
     save_input: String,
+    rename_input: String,
+    rename_original: Option<String>,
     shortcut_input: String,
     shortcut_return_dialog: Dialog,
     status: Option<StatusLine>,
@@ -311,6 +358,8 @@ impl App {
             search_before_edit: None,
             dialog: Dialog::None,
             save_input: String::new(),
+            rename_input: String::new(),
+            rename_original: None,
             shortcut_input: String::new(),
             shortcut_return_dialog: Dialog::None,
             status: Some(StatusLine {
@@ -330,6 +379,8 @@ impl App {
     fn reset_dialogs(&mut self) {
         self.dialog = Dialog::None;
         self.save_input.clear();
+        self.rename_input.clear();
+        self.rename_original = None;
         self.shortcut_input.clear();
         self.shortcut_return_dialog = Dialog::None;
     }
@@ -342,6 +393,12 @@ impl App {
         self.shortcut_return_dialog = return_dialog;
         self.dialog = Dialog::EditGhosttyShortcut;
         self.shortcut_input = env.ghostty_shortcut_display().to_string();
+    }
+
+    fn open_rename(&mut self, name: String) {
+        self.dialog = Dialog::Rename;
+        self.rename_input = name.clone();
+        self.rename_original = Some(name);
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -513,6 +570,7 @@ impl App {
 
         match self.dialog {
             Dialog::Save => self.handle_save_key(key),
+            Dialog::Rename => self.handle_rename_key(key),
             Dialog::ConfirmDelete => self.handle_delete_key(key),
             Dialog::Settings => self.handle_settings_key(key, env),
             Dialog::EditGhosttyShortcut => self.handle_shortcut_key(key),
@@ -543,6 +601,44 @@ impl App {
             }
             KeyCode::Char(c) if is_text_input(key.modifiers) => {
                 self.save_input.push(c);
+                Ok(Action::None)
+            }
+            _ => Ok(Action::None),
+        }
+    }
+
+    fn handle_rename_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.reset_dialogs();
+                Ok(Action::None)
+            }
+            KeyCode::Enter => {
+                let Some(original) = self.rename_original.clone() else {
+                    self.reset_dialogs();
+                    return Ok(Action::None);
+                };
+
+                let name = self.rename_input.trim().to_string();
+                if name.is_empty() {
+                    self.set_error("Workspace name cannot be empty");
+                    return Ok(Action::None);
+                }
+
+                if name == original {
+                    self.reset_dialogs();
+                    self.set_info("Workspace name unchanged");
+                    return Ok(Action::None);
+                }
+
+                Ok(Action::Rename(original, name))
+            }
+            KeyCode::Backspace => {
+                self.rename_input.pop();
+                Ok(Action::None)
+            }
+            KeyCode::Char(c) if is_text_input(key.modifiers) => {
+                self.rename_input.push(c);
                 Ok(Action::None)
             }
             _ => Ok(Action::None),
@@ -745,6 +841,17 @@ impl App {
                 };
                 Ok(Action::Edit(workspace.name.clone()))
             }
+            KeyCode::Char('n') => {
+                let Some(name) = self
+                    .selected_workspace()
+                    .map(|workspace| workspace.name.clone())
+                else {
+                    self.set_error("No workspace selected");
+                    return Ok(Action::None);
+                };
+                self.open_rename(name);
+                Ok(Action::None)
+            }
             KeyCode::Char('d') => {
                 if self.selected_workspace().is_some() {
                     self.dialog = Dialog::ConfirmDelete;
@@ -858,6 +965,7 @@ enum Action {
     Refresh,
     Launch(String),
     Save(String),
+    Rename(String, String),
     Edit(String),
     Delete(String),
     ToggleCloseTab,
@@ -962,6 +1070,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, env: &AppEnv) {
     match app.dialog {
         Dialog::None => {}
         Dialog::Save => draw_save_dialog(frame, app, &theme),
+        Dialog::Rename => draw_rename_dialog(frame, app, &theme),
         Dialog::ConfirmDelete => draw_delete_dialog(frame, app, &theme),
         Dialog::Settings => draw_settings_dialog(frame, app, env, &theme),
         Dialog::EditGhosttyShortcut => draw_shortcut_dialog(frame, app, env, &theme),
@@ -1174,6 +1283,13 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Span::styled("Esc", theme.accent),
             Span::raw(" cancel"),
         ])
+    } else if matches!(app.dialog, Dialog::Rename) {
+        Line::from(vec![
+            Span::styled("Enter", theme.accent),
+            Span::raw(" rename  "),
+            Span::styled("Esc", theme.accent),
+            Span::raw(" cancel"),
+        ])
     } else if matches!(app.dialog, Dialog::ConfirmDelete) {
         Line::from(vec![
             Span::styled("y", theme.accent),
@@ -1214,6 +1330,8 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Span::raw(" filter  "),
             Span::styled("a", theme.accent),
             Span::raw(" save  "),
+            Span::styled("n", theme.accent),
+            Span::raw(" rename  "),
             Span::styled("d", theme.accent),
             Span::raw(" remove  "),
             Span::styled("t", theme.accent),
@@ -1262,6 +1380,36 @@ fn draw_save_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
                     "..."
                 } else {
                     app.save_input.as_str()
+                },
+                theme.accent,
+            )),
+        ]))
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn draw_rename_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+    let workspace_name = app.rename_original.as_deref().unwrap_or("this workspace");
+    let area = centered_rect(58, 36, frame.area());
+    let inner = draw_dialog_shell(
+        frame,
+        area,
+        "Rename Workspace",
+        "Enter rename | Esc cancel",
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            section_line(inner.width, "Selection", theme),
+            Line::from(Span::styled(workspace_name, theme.emphasis)),
+            Line::default(),
+            section_line(inner.width, "New Name", theme),
+            Line::from(Span::styled(
+                if app.rename_input.is_empty() {
+                    "..."
+                } else {
+                    app.rename_input.as_str()
                 },
                 theme.accent,
             )),
@@ -1386,7 +1534,7 @@ fn draw_help_dialog(frame: &mut Frame<'_>, theme: &Theme) {
             Line::from("Enter keep  Esc revert"),
             Line::default(),
             section_line(inner.width, "Actions", theme),
-            Line::from("Enter launch  a save  e edit  d remove"),
+            Line::from("Enter launch  a save  n rename  e edit  d remove"),
             Line::from("g edit Ghostty shortcut  r reload  t settings"),
             Line::from("q quit"),
             Line::default(),
@@ -1556,13 +1704,6 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-}
-
 fn is_text_input(modifiers: KeyModifiers) -> bool {
     !modifiers.intersects(
         KeyModifiers::CONTROL
@@ -1580,7 +1721,7 @@ fn should_start_quick_search(c: char, modifiers: KeyModifiers) -> bool {
 
     !matches!(
         c.to_ascii_lowercase(),
-        '/' | '?' | 'a' | 'd' | 'e' | 'g' | 'j' | 'k' | 'q' | 'r' | 's' | 't' | 'w'
+        '/' | '?' | 'a' | 'd' | 'e' | 'g' | 'j' | 'k' | 'n' | 'q' | 'r' | 's' | 't' | 'w'
     )
 }
 
@@ -1776,6 +1917,7 @@ mod tests {
         assert!(!should_start_quick_search('a', KeyModifiers::NONE));
         assert!(should_start_quick_search('c', KeyModifiers::NONE));
         assert!(!should_start_quick_search('g', KeyModifiers::NONE));
+        assert!(!should_start_quick_search('n', KeyModifiers::NONE));
         assert!(!should_start_quick_search('q', KeyModifiers::NONE));
     }
 
@@ -1812,6 +1954,51 @@ mod tests {
     }
 
     #[test]
+    fn main_screen_n_opens_rename_dialog_with_existing_name() {
+        let mut app = App::new(vec![workspace("alpha")]);
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('n')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::Rename);
+        assert_eq!(app.rename_original.as_deref(), Some("alpha"));
+        assert_eq!(app.rename_input, "alpha");
+    }
+
+    #[test]
+    fn rename_dialog_returns_rename_action() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.open_rename("alpha".to_string());
+        app.rename_input = "beta".to_string();
+
+        assert_eq!(
+            app.handle_rename_key(KeyEvent::from(KeyCode::Enter))
+                .unwrap(),
+            Action::Rename("alpha".to_string(), "beta".to_string())
+        );
+    }
+
+    #[test]
+    fn rename_dialog_closes_without_action_when_name_is_unchanged() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.open_rename("alpha".to_string());
+
+        assert_eq!(
+            app.handle_rename_key(KeyEvent::from(KeyCode::Enter))
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::None);
+        assert!(app.rename_original.is_none());
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("Workspace name unchanged")
+        );
+    }
+
+    #[test]
     fn main_screen_q_returns_quit_action() {
         let mut app = App::new(vec![workspace("alpha")]);
 
@@ -1820,16 +2007,6 @@ mod tests {
                 .unwrap(),
             Action::Quit
         );
-    }
-
-    #[test]
-    fn keyboard_enhancement_flags_enable_alternate_key_reporting() {
-        let flags = keyboard_enhancement_flags();
-
-        assert!(flags.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
-        assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 
     #[test]

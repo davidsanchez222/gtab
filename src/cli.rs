@@ -30,6 +30,8 @@ pub enum Commands {
     Save { name: String },
     /// Edit a workspace AppleScript file in $EDITOR.
     Edit { name: String },
+    /// Rename a workspace.
+    Rename { old: String, new: String },
     /// Remove a workspace.
     Remove { name: String },
     /// Show or update settings.

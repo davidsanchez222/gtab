@@ -2,47 +2,15 @@
 
 **English** | [中文](README_CN.md)
 
-`gtab` is a lightweight workspace manager for Ghostty on macOS.
+`gtab` is a lightweight workspace manager for [Ghostty](https://ghostty.org) on macOS.
 
-If you like Ghostty's native tabs and just want to save a window layout, name it, and bring it back later, this is the tool. It is intentionally small. It does not try to be a terminal multiplexer.
+Save your current Ghostty window layout as a named workspace. Reopen it later with a single keystroke. That is the whole idea.
 
 ![gtab demo](Gtab.gif)
 
 ---
 
-## What It Does
-
-- Save the current Ghostty window as a named workspace
-- Restore that workspace later as a fresh Ghostty window with native tabs
-- Keep the saved tab order, working directory, and tab title
-- Let you search and launch workspaces from a small keyboard-first TUI
-- Add a fast Ghostty-local `Cmd+G` launcher with `gtab init`
-
-## What It Does Not Do
-
-- It does not persist running processes
-- It does not restore shell history, editor buffers, SSH sessions, or pane state
-- It does not replace tmux for detach/attach, panes, or remote workflows
-
-## Who It Is For
-
-- macOS developers who use Ghostty as their main terminal
-- people who prefer native Ghostty tabs over tmux panes
-- people who want lightweight workspace recall without adding a heavy workflow layer
-
-## Who It Is Not For
-
-- people who already live in tmux
-- people who need a real multiplexer with panes, sessions, and remote persistence
-- people who want a shortcut that is always safe inside Claude Code, Codex, vim, or fzf
-
----
-
-## Install
-
-### Homebrew
-
-Recommended for normal users:
+## Quick Install
 
 ```bash
 brew tap Franvy/gtab
@@ -50,174 +18,186 @@ brew install gtab
 gtab init
 ```
 
-Then reload Ghostty config or restart Ghostty.
+Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghostty shell to open the workspace launcher.
 
-### Build from source
+---
 
-Requirements:
+## What It Does
 
-- macOS
-- [Ghostty](https://ghostty.org)
-- Rust toolchain
+- Save a Ghostty window as a named workspace — tabs, working directories, titles, and split panes
+- Reopen any workspace later as a fresh Ghostty window with native tabs
+- Launch from a small keyboard-first TUI, or directly from the shell
+- New window automatically aligns to your current Ghostty window position and size
+- Rename, delete, and search workspaces without leaving the TUI
+- Fast in-app shortcut via `Cmd+G` set up with `gtab init`
 
-Install:
+## What It Does Not Do
 
-```bash
-cargo install --path .
-gtab init
-```
-
-Then reload Ghostty config or restart Ghostty.
-
-## Uninstall
-Disable the Ghostty-local shortcut:
-
-```bash
-gtab set ghostty_shortcut off
-```
-
-Then reload Ghostty config or restart Ghostty so `Cmd+G` stops sending `gtab` to the current shell.
-
-Remove the installed binary:
-
-```bash
-brew uninstall gtab
-```
-
-or:
-
-```bash
-cargo uninstall gtab
-```
-
-After Ghostty has reloaded without the managed shortcut include, you can also remove saved workspaces and local config:
-
-```bash
-rm -rf ~/.config/gtab
-```
+- Does not persist running processes
+- Does not restore shell history, editor buffers, SSH sessions, or pane state
+- Does not replace tmux for detach/attach, panes, or remote workflows
 
 ---
 
 ## Typical Workflow
 
-1. Open Ghostty and arrange the tabs you want.
-2. Save that layout:
+1. Open Ghostty, arrange your tabs the way you want.
+2. Save the layout:
 
 ```bash
 gtab save myproject
 ```
 
-3. Later, open the launcher with `Cmd+G` inside Ghostty or just run:
-
-```bash
-gtab
-```
-
-4. Search for the workspace and press Enter to relaunch it.
-5. If you already know the name, launch it directly:
+3. Press `Cmd+G` inside Ghostty (or run `gtab`) to open the TUI.
+4. Type to search, press `Enter` to launch.
+5. Or launch directly by name:
 
 ```bash
 gtab myproject
 ```
 
-That is the whole model: save a Ghostty tab layout, then reopen it quickly later.
+---
 
-## TUI Basics
+## TUI Keys
 
-Inside the TUI, the common keys are:
+| Key | Action |
+|-----|--------|
+| `/` | Search workspaces |
+| `↑` / `↓` | Move selection |
+| `Enter` | Launch selected workspace |
+| `a` | Save current Ghostty window as new workspace |
+| `n` | Rename selected workspace |
+| `d` | Delete selected workspace |
+| `e` | Open workspace file in `$EDITOR` |
+| `g` | Edit Ghostty shortcut |
+| `q` / `Esc` | Quit |
 
-- `/` to start search
-- `Enter` to launch the selected workspace
-- `a` to save the current Ghostty window
-- `d` to remove the selected workspace
-- `q` to quit
+> **Double-click** a workspace row also launches it.
+
+When you launch from the TUI, the new Ghostty window is repositioned to match your current window's position and size. This uses macOS Accessibility (System Events), so you may need to grant permission once.
 
 ---
 
 ## Core Commands
 
 ```text
-gtab                 Open the TUI
-gtab init            Enable the default Ghostty-local Cmd+G
-gtab save <name>     Save the current Ghostty window
-gtab <name>          Launch a workspace directly
-gtab list            List saved workspaces
-gtab remove <name>   Remove a workspace
+gtab                     Open the TUI
+gtab init                Enable the Ghostty-local Cmd+G shortcut
+gtab save <name>         Save the current Ghostty window
+gtab <name>              Launch a workspace directly
+gtab list                List saved workspaces
+gtab rename <old> <new>  Rename a workspace
+gtab remove <name>       Remove a workspace
 ```
 
 ## Advanced Commands
 
 ```text
-gtab edit <name>
-gtab set
-gtab set close_tab on|off
-gtab set ghostty_shortcut cmd+g|off
+gtab edit <name>                       Open workspace file in $EDITOR
+gtab set                               Show current settings
+gtab set close_tab on|off              Auto-close the launching tab after launch
+gtab set ghostty_shortcut cmd+g|off    Change or disable the Ghostty shortcut
 ```
 
-Saved workspaces are plain AppleScript files under `~/.config/gtab/`, so you can inspect or edit them if needed.
+Workspaces are stored as plain `.applescript` files in `~/.config/gtab/` and are human-readable and manually editable.
+
+---
+
+## Install
+
+### Homebrew (recommended)
+
+```bash
+brew tap Franvy/gtab
+brew install gtab
+gtab init
+```
+
+Reload Ghostty config or restart Ghostty. Then press `Cmd+G` inside any Ghostty shell.
+
+### Build from source
+
+Requirements: macOS, [Ghostty](https://ghostty.org), Rust toolchain.
+
+```bash
+cargo install --path .
+gtab init
+```
+
+### Update
+
+```bash
+brew upgrade gtab
+```
+
+---
+
+## Uninstall
+
+```bash
+# Disable the Ghostty shortcut first
+gtab set ghostty_shortcut off
+
+# Reload Ghostty config so Cmd+G stops working
+
+# Then remove the binary
+brew uninstall gtab
+# or: cargo uninstall gtab
+
+# Optionally remove saved workspaces and config
+rm -rf ~/.config/gtab
+```
 
 ---
 
 ## Shortcut Model
 
-`gtab init` enables the default fast path:
+`gtab init` writes a managed Ghostty keybind file and adds an `include` line to your Ghostty config:
 
 ```conf
 keybind = cmd+g=text:gtab\x0d
 ```
 
-This works only when Ghostty is focused, and it feels fast because it is effectively the same as typing `gtab` in the current shell.
+This works only when Ghostty is focused. It is fast because it is effectively the same as typing `gtab` in the active shell.
 
-Tradeoff:
-
-- it is fast and same-tab
-- it is not safe inside interactive full-screen tools like Claude Code, Codex, vim, or fzf
-
-## gtab vs tmux
-
-`gtab` and tmux solve different problems.
-
-| Topic | gtab | tmux |
-| --- | --- | --- |
-| Main idea | Save and relaunch Ghostty tab layouts | Full terminal multiplexer |
-| Interface | Native Ghostty tabs | tmux sessions, windows, panes |
-| State restored | Tab order, working dirs, titles | Multiplexer-managed sessions and panes |
-| Learning curve | Low | Higher |
-| Remote / detach / attach | No | Yes |
-| Best for | Ghostty-first macOS users who want something light | Users who want a powerful terminal workflow layer |
-
-If you already know you want panes, persistent sessions, remote attach, or server-side terminal workflows, use tmux.
-
-If you are a Ghostty user on macOS and your need is simpler, "save this set of tabs and bring it back later," `gtab` is the lighter tool.
+**Tradeoff:** this shortcut is not safe inside full-screen interactive programs like Claude Code, vim, or fzf — it will type the literal text `gtab` into them. Quit those programs first, or use `gtab <name>` from a clean shell prompt.
 
 ---
 
-## FAQ
+## gtab vs tmux
 
-### Why does the Ghostty shortcut send `gtab` as text instead of executing the `gtab` binary directly?
-
-Because Ghostty keybindings currently do not expose an action for "run an external command directly." The official keybinding actions are built-in Ghostty actions or terminal-encoding actions like `text`, `csi`, and `esc`.
-
-Docs:
-
-- https://ghostty.org/docs/config/keybind
-- https://ghostty.org/docs/config/keybind/reference
-
-So the fast Ghostty-local launcher uses:
-
-```conf
-keybind = cmd+g=text:gtab\x0d
-```
-
-That is why it feels like manually entering `gtab`: it is doing almost exactly that.
+| Topic | gtab | tmux |
+|-------|------|------|
+| Main idea | Save and relaunch Ghostty tab layouts | Full terminal multiplexer |
+| Interface | Native Ghostty tabs | tmux sessions, windows, panes |
+| State restored | Tab order, working dirs, titles, splits | Multiplexer-managed sessions and panes |
+| Learning curve | Low | Higher |
+| Remote / detach / attach | No | Yes |
+| Best for | Ghostty-first macOS users | Users who need a full workflow layer |
 
 ---
 
 ## How It Works
 
-`gtab save` reads the current Ghostty window through Ghostty's AppleScript API and writes a plain `.applescript` workspace file. Launching that workspace later opens a fresh Ghostty window and recreates the saved tabs with their working directories and titles.
+`gtab save` reads the current Ghostty window through Ghostty's AppleScript API. For split-pane tabs, it also queries macOS Accessibility to capture pane positions, then reconstructs the split tree. The result is a plain `.applescript` file stored in `~/.config/gtab/`.
+
+Launching a workspace runs that script via `osascript` to open a fresh Ghostty window and recreate the saved layout.
 
 That is why `gtab` is lightweight: it stores layout metadata, not live terminal session state.
+
+---
+
+## FAQ
+
+### Why does `Cmd+G` type text instead of running the binary directly?
+
+Ghostty keybindings do not have an action for running external commands. The `text` action sends a string to the active shell — which is effectively the same as typing it yourself.
+
+See: [ghostty.org/docs/config/keybind](https://ghostty.org/docs/config/keybind)
+
+### Does gtab support split panes?
+
+Yes, as of v1.4.1. `gtab save` captures split pane layouts. Splits are restored when launching.
 
 ---
 

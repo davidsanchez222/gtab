@@ -42,6 +42,16 @@ fn run() -> Result<()> {
             Ok(())
         }
         (Some(Commands::Edit { name }), None) => env.open_in_editor(&name),
+        (Some(Commands::Rename { old, new }), None) => {
+            if old == new {
+                println!("Workspace name unchanged.");
+                return Ok(());
+            }
+
+            env.rename_workspace(&old, &new)?;
+            println!("Renamed workspace \"{old}\" to \"{new}\"");
+            Ok(())
+        }
         (Some(Commands::Remove { name }), None) => {
             env.remove_workspace(&name)?;
             println!("Removed workspace \"{name}\"");
