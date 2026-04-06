@@ -6,7 +6,7 @@
 
 把当前 Ghostty 窗口布局保存成一个有名字的 workspace，以后一键拉起。就这么简单。
 
-![gtab demo](Gtab.gif)
+<video src="https://github.com/Franvy/gtab/releases/download/v1.4.1/gtab.mp4" autoplay loop muted playsinline></video>
 
 ---
 
