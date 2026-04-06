@@ -6,7 +6,7 @@
 
 Save your current Ghostty window layout as a named workspace. Reopen it later with a single keystroke. That is the whole idea.
 
-<video src="https://github.com/Franvy/gtab/releases/download/v1.4.1/gtab.mp4" autoplay loop muted playsinline></video>
+<video src="https://github.com/user-attachments/assets/f448994b-5c92-4215-aca7-624b62b50131" autoplay loop muted playsinline></video>
 
 ---
 
