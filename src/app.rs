@@ -2008,6 +2008,23 @@ mod tests {
     }
 
     #[test]
+    fn save_dialog_rejects_empty_name() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.dialog = Dialog::Save;
+        app.save_input = "   ".to_string();
+
+        assert_eq!(
+            app.handle_save_key(KeyEvent::from(KeyCode::Enter)).unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::Save);
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("Workspace name cannot be empty")
+        );
+    }
+
+    #[test]
     fn main_screen_q_returns_quit_action() {
         let mut app = App::new(vec![workspace("alpha")]);
 
@@ -2015,6 +2032,72 @@ mod tests {
             app.handle_main_key(KeyEvent::from(KeyCode::Char('q')), &env())
                 .unwrap(),
             Action::Quit
+        );
+    }
+
+    #[test]
+    fn main_screen_enter_without_selection_sets_error() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.filter = "zzz".to_string();
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Enter), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("No workspace selected")
+        );
+    }
+
+    #[test]
+    fn main_screen_delete_without_selection_sets_error() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.filter = "zzz".to_string();
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('d')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::None);
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("No workspace selected")
+        );
+    }
+
+    #[test]
+    fn main_screen_edit_without_selection_sets_error() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.filter = "zzz".to_string();
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('e')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("No workspace selected")
+        );
+    }
+
+    #[test]
+    fn main_screen_escape_clears_filter_before_quitting() {
+        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        app.filter = "al".to_string();
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Esc), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert!(app.filter.is_empty());
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("Cleared workspace filter")
         );
     }
 
@@ -2063,6 +2146,49 @@ mod tests {
             Action::None
         );
         assert_eq!(app.shortcut_input, "cmd+shift+g");
+    }
+
+    #[test]
+    fn settings_shortcut_escape_returns_to_settings_dialog() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.open_shortcut_editor(&env(), Dialog::Settings);
+
+        assert_eq!(
+            app.handle_shortcut_key(KeyEvent::from(KeyCode::Esc))
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::Settings);
+        assert!(app.shortcut_input.is_empty());
+    }
+
+    #[test]
+    fn settings_dialog_space_toggles_close_tab() {
+        let mut app = App::new(vec![workspace("alpha")]);
+        app.dialog = Dialog::Settings;
+
+        assert_eq!(
+            app.handle_settings_key(KeyEvent::from(KeyCode::Char(' ')), &env())
+                .unwrap(),
+            Action::ToggleCloseTab
+        );
+    }
+
+    #[test]
+    fn search_enter_commits_filter_and_sets_status() {
+        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        app.begin_search(Some('l'));
+
+        assert_eq!(
+            app.handle_search_key(KeyEvent::from(KeyCode::Enter))
+                .unwrap(),
+            Action::None
+        );
+        assert!(!app.search_active());
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("Showing 1 of 2 workspaces")
+        );
     }
 
     #[test]

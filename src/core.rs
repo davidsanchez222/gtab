@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, c_void};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -22,6 +22,9 @@ const LEGACY_HOTKEY_SERVICE_LABEL: &str = "com.franvy.gtab.hotkey";
 const LEGACY_HOTKEY_PLIST_NAME: &str = "com.franvy.gtab.hotkey.plist";
 const LEGACY_HOTKEY_LOG_NAME: &str = "gtab-hotkey.log";
 const NIX_STORE_ROOT: &str = "/nix/store";
+const LAUNCH_WARNING_UNSUPPORTED_CUSTOM_CONFIG: &str = "workspace launched without frame sync; saved AppleScript uses unsupported custom configuration";
+const LAUNCH_WARNING_RECONSTRUCTION_FAILED: &str =
+    "workspace launched without frame sync; saved AppleScript could not be reconstructed";
 #[cfg(target_os = "macos")]
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
@@ -115,6 +118,44 @@ pub struct AppEnv {
 struct TabRow {
     working_dir: String,
     title: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceLaunchMode {
+    DirectLegacy,
+    DirectSplit,
+    Reconstructed,
+    DirectFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedTabSurface {
+    tab_index: usize,
+    pane_index: usize,
+    terminal_id: String,
+    working_dir: String,
+    title: String,
+    rect: CapturedPaneRect,
+    selected: bool,
+    window_title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedPaneRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccessibilityElement {
+    role: String,
+    name: String,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
 }
 
 impl AppEnv {
@@ -283,36 +324,33 @@ impl AppEnv {
         let script = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
 
-        if workspace_requires_true_legacy_launch(&script) {
-            self.launch_workspace_script_path(&path)?;
-            self.finish_workspace_launch()?;
-            return Ok(Some(
-                "workspace launched without frame sync; saved AppleScript uses unsupported custom configuration".to_string(),
-            ));
-        }
-
-        if workspace_has_splits(&script) {
-            let existing_window_ids = ghostty_window_ids()?;
-            self.launch_workspace_script_path(&path)?;
-            if let Ok(window_id) = wait_for_new_ghostty_window_id(&existing_window_ids) {
-                let _ = reposition_ghostty_window(&window_id, frame);
-            }
-            self.finish_workspace_launch()?;
-            return Ok(None);
-        }
-
         let rows = parse_workspace_rows(&script);
-        if rows.is_empty() {
-            self.launch_workspace_script_path(&path)?;
-            self.finish_workspace_launch()?;
-            return Ok(Some(
-                "workspace launched without frame sync; saved AppleScript could not be reconstructed".to_string(),
-            ));
+        match plan_workspace_launch(&script, &rows) {
+            WorkspaceLaunchMode::DirectLegacy => {
+                self.launch_workspace_script_path(&path)?;
+                self.finish_workspace_launch()?;
+                Ok(Some(LAUNCH_WARNING_UNSUPPORTED_CUSTOM_CONFIG.to_string()))
+            }
+            WorkspaceLaunchMode::DirectSplit => {
+                let existing_window_ids = ghostty_window_ids()?;
+                self.launch_workspace_script_path(&path)?;
+                if let Ok(window_id) = wait_for_new_ghostty_window_id(&existing_window_ids) {
+                    let _ = reposition_ghostty_window(&window_id, frame);
+                }
+                self.finish_workspace_launch()?;
+                Ok(None)
+            }
+            WorkspaceLaunchMode::Reconstructed => {
+                launch_workspace_rows_in_background(&rows, frame)?;
+                self.finish_workspace_launch()?;
+                Ok(None)
+            }
+            WorkspaceLaunchMode::DirectFallback => {
+                self.launch_workspace_script_path(&path)?;
+                self.finish_workspace_launch()?;
+                Ok(Some(LAUNCH_WARNING_RECONSTRUCTION_FAILED.to_string()))
+            }
         }
-
-        launch_workspace_rows_in_background(&rows, frame)?;
-        self.finish_workspace_launch()?;
-        Ok(None)
     }
 
     pub fn capture_frontmost_ghostty_window_frame(&self) -> Result<WindowFrame> {
@@ -803,18 +841,19 @@ fn capture_workspace_script() -> Result<String> {
         r#"set D to (ASCII character 9)
 tell application "Ghostty"
   set win to front window
+  set winTitle to name of win
   set tabList to tabs of win
   set allLines to {}
   repeat with ti from 1 to count of tabList
     set t to item ti of tabList
     set termList to every terminal of t
     set ttl to name of t
-    if ttl starts with "⠐ " then set ttl to text 3 thru -1 of ttl
+    set isSelected to selected of t
     if (count of termList) = 1 then
       set term to item 1 of termList
       set wd to working directory of term
       if wd = "" then set wd to POSIX path of (path to home folder)
-      set end of allLines to (ti as text) & D & "1" & D & (id of term as text) & D & wd & D & ttl & D & "0,0,1,1"
+      set end of allLines to (ti as text) & D & "1" & D & (id of term as text) & D & wd & D & ttl & D & "0,0,1,1" & D & (isSelected as text) & D & winTitle
     else
       repeat with pi from 1 to count of termList
         set term to item pi of termList
@@ -836,7 +875,7 @@ tell application "Ghostty"
             set posStr to ((item 1 of pos) as text) & "," & ((item 2 of pos) as text) & "," & ((item 1 of sz) as text) & "," & ((item 2 of sz) as text)
           end try
         end tell
-        set end of allLines to (ti as text) & D & (pi as text) & D & (id of term as text) & D & wd & D & ttl & D & posStr
+        set end of allLines to (ti as text) & D & (pi as text) & D & (id of term as text) & D & wd & D & ttl & D & posStr & D & (isSelected as text) & D & winTitle
       end repeat
     end if
   end repeat
@@ -849,6 +888,20 @@ end tell"#,
     if raw.trim().is_empty() {
         bail!("could not read Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
+
+    let mut captured = parse_captured_tab_surfaces(&raw);
+    if captured.is_empty() {
+        bail!("could not parse Ghostty tabs (make sure Ghostty is the frontmost app)");
+    }
+
+    let tab_count = captured
+        .iter()
+        .map(|surface| surface.tab_index)
+        .max()
+        .unwrap_or(0);
+    let visible_titles = capture_frontmost_ghostty_tab_titles_via_ax(tab_count);
+    apply_best_available_tab_titles(&mut captured, visible_titles.as_ref());
+    let normalized = serialize_captured_tab_surfaces(&captured);
 
     // Phase 2: reconstruct split trees from positions and generate restore script
     let py = r#"import sys
@@ -958,7 +1011,7 @@ print('\n'.join(out))
             .as_mut()
             .context("failed to open python3 stdin")?;
         stdin
-            .write_all(raw.as_bytes())
+            .write_all(normalized.as_bytes())
             .context("failed to write tab data to python3")?;
     }
 
@@ -972,6 +1025,286 @@ print('\n'.join(out))
     }
 
     String::from_utf8(output.stdout).context("python3 output was not valid UTF-8")
+}
+
+fn parse_captured_tab_surfaces(raw: &str) -> Vec<CapturedTabSurface> {
+    raw.lines().filter_map(parse_captured_tab_surface).collect()
+}
+
+fn parse_captured_tab_surface(line: &str) -> Option<CapturedTabSurface> {
+    let mut parts = line.split('\t');
+    let tab_index = parts.next()?.trim().parse().ok()?;
+    let pane_index = parts.next()?.trim().parse().ok()?;
+    let terminal_id = parts.next()?.trim().to_string();
+    let working_dir = parts.next()?.to_string();
+    let title = normalize_captured_tab_title(parts.next()?);
+    let rect = parse_captured_pane_rect(parts.next()?)?;
+    let selected = parts
+        .next()
+        .map(|value| matches!(value.trim(), "true" | "yes" | "1"))
+        .unwrap_or(false);
+    let window_title = parts
+        .next()
+        .map(normalize_captured_tab_title)
+        .unwrap_or_default();
+
+    Some(CapturedTabSurface {
+        tab_index,
+        pane_index,
+        terminal_id,
+        working_dir,
+        title,
+        rect,
+        selected,
+        window_title,
+    })
+}
+
+fn parse_captured_pane_rect(value: &str) -> Option<CapturedPaneRect> {
+    let mut parts = value.split(',').map(str::trim);
+    let x = parts.next()?.parse().ok()?;
+    let y = parts.next()?.parse().ok()?;
+    let width = parts.next()?.parse().ok()?;
+    let height = parts.next()?.parse().ok()?;
+
+    Some(CapturedPaneRect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn serialize_captured_tab_surfaces(rows: &[CapturedTabSurface]) -> String {
+    let mut out = String::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+
+        out.push_str(&row.tab_index.to_string());
+        out.push('\t');
+        out.push_str(&row.pane_index.to_string());
+        out.push('\t');
+        out.push_str(&row.terminal_id);
+        out.push('\t');
+        out.push_str(&row.working_dir);
+        out.push('\t');
+        out.push_str(&row.title);
+        out.push('\t');
+        out.push_str(&format!(
+            "{},{},{},{}",
+            row.rect.x, row.rect.y, row.rect.width, row.rect.height
+        ));
+        out.push('\t');
+        out.push_str(if row.selected { "true" } else { "false" });
+        out.push('\t');
+        out.push_str(&row.window_title);
+    }
+
+    out
+}
+
+fn apply_best_available_tab_titles(
+    rows: &mut [CapturedTabSurface],
+    visible_titles: Option<&BTreeMap<usize, String>>,
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    if let Some(visible_titles) = visible_titles {
+        for row in rows.iter_mut() {
+            if let Some(title) = visible_titles.get(&row.tab_index) {
+                row.title = title.clone();
+            }
+        }
+        return;
+    }
+
+    if let Some(selected_row) = rows
+        .iter()
+        .find(|row| row.selected && !row.window_title.is_empty() && row.window_title != row.title)
+    {
+        let selected_tab_index = selected_row.tab_index;
+        let window_title = selected_row.window_title.clone();
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.tab_index == selected_tab_index)
+        {
+            row.title = window_title.clone();
+        }
+    }
+}
+
+fn normalize_captured_tab_title(raw: &str) -> String {
+    let mut title = raw.trim().to_string();
+
+    loop {
+        let stripped = strip_spinner_prefix(&title)
+            .or_else(|| title.strip_prefix("🔔 ").map(str::to_string))
+            .map(|value| value.trim_start().to_string());
+
+        match stripped {
+            Some(next) if next != title => title = next,
+            _ => break,
+        }
+    }
+
+    title.trim().to_string()
+}
+
+fn strip_spinner_prefix(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let first = chars.next()?;
+    let is_braille_spinner = matches!(first as u32, 0x2800..=0x28ff);
+    if !is_braille_spinner {
+        return None;
+    }
+
+    let rest = chars.as_str();
+    let trimmed = rest.trim_start_matches(char::is_whitespace);
+    if trimmed.len() == rest.len() {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn capture_frontmost_ghostty_tab_titles_via_ax(
+    expected_tab_count: usize,
+) -> Option<BTreeMap<usize, String>> {
+    if expected_tab_count == 0 {
+        return Some(BTreeMap::new());
+    }
+
+    let raw = run_osascript(
+        r#"set D to (ASCII character 9)
+tell application "System Events"
+  tell process "Ghostty"
+    set targetWindow to missing value
+    repeat with candidate in windows
+      try
+        if value of attribute "AXMain" of candidate is true then
+          set targetWindow to candidate
+          exit repeat
+        end if
+      end try
+    end repeat
+    if targetWindow is missing value then
+      if (count of windows) is 0 then error "Ghostty has no visible window"
+      set targetWindow to window 1
+    end if
+    set {windowX, windowY} to position of targetWindow
+    set rows to {}
+    repeat with elem in entire contents of targetWindow
+      try
+        set elemRole to role of elem
+        if elemRole is "AXRadioButton" or elemRole is "AXButton" or elemRole is "AXStaticText" then
+          set elemName to name of elem
+          if elemName is not missing value and elemName is not "" then
+            set {xPos, yPos} to position of elem
+            set {elemWidth, elemHeight} to size of elem
+            set end of rows to elemRole & D & elemName & D & ((xPos - windowX) as text) & D & ((yPos - windowY) as text) & D & (elemWidth as text) & D & (elemHeight as text)
+          end if
+        end if
+      end try
+    end repeat
+  end tell
+end tell
+set AppleScript's text item delimiters to linefeed
+return rows as text"#,
+    )
+    .ok()?;
+
+    let elements = parse_accessibility_elements(&raw);
+    infer_tab_titles_from_accessibility_elements(&elements, expected_tab_count)
+}
+
+fn parse_accessibility_elements(raw: &str) -> Vec<AccessibilityElement> {
+    raw.lines()
+        .filter_map(parse_accessibility_element)
+        .collect()
+}
+
+fn parse_accessibility_element(line: &str) -> Option<AccessibilityElement> {
+    let mut parts = line.split('\t');
+    let role = parts.next()?.to_string();
+    let name = normalize_captured_tab_title(parts.next()?);
+    let x = parts.next()?.trim().parse().ok()?;
+    let y = parts.next()?.trim().parse().ok()?;
+    let width = parts.next()?.trim().parse().ok()?;
+    let height = parts.next()?.trim().parse().ok()?;
+
+    Some(AccessibilityElement {
+        role,
+        name,
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn infer_tab_titles_from_accessibility_elements(
+    elements: &[AccessibilityElement],
+    expected_tab_count: usize,
+) -> Option<BTreeMap<usize, String>> {
+    const ROLE_PRIORITY: [&str; 3] = ["AXRadioButton", "AXButton", "AXStaticText"];
+    const MAX_TABBAR_RELATIVE_Y: i32 = 120;
+    const MIN_TAB_WIDTH: i32 = 24;
+    const MIN_TAB_HEIGHT: i32 = 10;
+    const MIN_TAB_RELATIVE_X: i32 = 40;
+
+    let mut best_match: Option<(usize, i32, Vec<String>)> = None;
+
+    for (priority, role) in ROLE_PRIORITY.iter().enumerate() {
+        let mut groups: BTreeMap<i32, Vec<&AccessibilityElement>> = BTreeMap::new();
+
+        for element in elements.iter().filter(|element| {
+            element.role == *role
+                && !element.name.is_empty()
+                && element.x >= MIN_TAB_RELATIVE_X
+                && element.y >= 0
+                && element.y <= MAX_TABBAR_RELATIVE_Y
+                && element.width >= MIN_TAB_WIDTH
+                && element.height >= MIN_TAB_HEIGHT
+        }) {
+            groups.entry(element.y / 12).or_default().push(element);
+        }
+
+        for group in groups.values_mut() {
+            group.sort_by_key(|element| (element.x, element.y));
+            let names: Vec<String> = group
+                .iter()
+                .map(|element| normalize_captured_tab_title(&element.name))
+                .filter(|name| !name.is_empty())
+                .collect();
+            if names.len() != expected_tab_count {
+                continue;
+            }
+
+            let total_width = group.iter().map(|element| element.width).sum();
+            let candidate = (priority, total_width, names);
+            let is_better = best_match
+                .as_ref()
+                .map(|best| candidate.0 < best.0 || (candidate.0 == best.0 && candidate.1 > best.1))
+                .unwrap_or(true);
+            if is_better {
+                best_match = Some(candidate);
+            }
+        }
+    }
+
+    let (_, _, names) = best_match?;
+    Some(
+        names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (index + 1, name))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -1248,6 +1581,18 @@ fn parse_workspace_rows(script: &str) -> Vec<TabRow> {
             title: tab.title.unwrap_or_default(),
         })
         .collect()
+}
+
+fn plan_workspace_launch(script: &str, rows: &[TabRow]) -> WorkspaceLaunchMode {
+    if workspace_requires_true_legacy_launch(script) {
+        WorkspaceLaunchMode::DirectLegacy
+    } else if workspace_has_splits(script) {
+        WorkspaceLaunchMode::DirectSplit
+    } else if rows.is_empty() {
+        WorkspaceLaunchMode::DirectFallback
+    } else {
+        WorkspaceLaunchMode::Reconstructed
+    }
 }
 
 fn parse_workspace_tabs(script: &str) -> Vec<WorkspaceTab> {
@@ -1712,14 +2057,17 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame,
-        apple_escape, build_ghostty_shortcut_include, build_workspace_followup_script,
-        build_workspace_script, parse_window_frame, parse_workspace_rows, parse_workspace_tabs,
+        AccessibilityElement, AppEnv, CapturedPaneRect, CapturedTabSurface, Config,
+        GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame, WorkspaceLaunchMode,
+        apple_escape, apply_best_available_tab_titles, build_ghostty_shortcut_include,
+        build_workspace_followup_script, build_workspace_script, format_workspace_list,
+        infer_tab_titles_from_accessibility_elements, normalize_captured_tab_title,
+        parse_window_frame, parse_workspace_rows, parse_workspace_tabs, plan_workspace_launch,
         render_ghostty_include_config_line, should_switch_to_ascii_input_source,
-        sync_ghostty_include_reference, workspace_has_splits,
+        sync_ghostty_include_reference, validate_workspace_name, workspace_has_splits,
         workspace_requires_true_legacy_launch,
     };
-    use std::{fs, path::PathBuf};
+    use std::{collections::BTreeMap, fs, path::PathBuf};
 
     #[cfg(unix)]
     use std::os::unix::{fs::symlink, prelude::PermissionsExt};
@@ -1761,6 +2109,26 @@ mod tests {
     fn config_defaults_to_ghostty_local_cmd_g() {
         let config = Config::default();
         assert_eq!(config.ghostty_shortcut, "cmd+g");
+    }
+
+    #[test]
+    fn validate_workspace_name_rejects_empty_and_path_like_names() {
+        for value in ["", "   ", ".", "..", "alpha/beta"] {
+            assert!(
+                validate_workspace_name(value).is_err(),
+                "{value:?} should fail"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_workspace_name_accepts_plain_names() {
+        for value in ["alpha", "demo-1", "hello_world"] {
+            assert!(
+                validate_workspace_name(value).is_ok(),
+                "{value:?} should pass"
+            );
+        }
     }
 
     #[test]
@@ -1853,6 +2221,32 @@ end tell
     }
 
     #[test]
+    fn workspace_preview_skips_malformed_lines_and_keeps_valid_tabs() {
+        let tabs = parse_workspace_tabs(
+            r#"tell application "Ghostty"
+    activate
+
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set win to new window with configuration cfg1
+    set term1 to focused terminal of selected tab of win
+    perform action "set_tab_title:api" on term1
+    perform action "set_tab_title:broken
+
+    set cfg2 to new surface configuration
+    set initial working directory of cfg2 to "/tmp/worker"
+    set tab2 to new tab in win with configuration cfg2
+    set term2 to focused terminal of tab2
+end tell
+"#,
+        );
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].title, "api");
+        assert_eq!(tabs[1].title, "worker");
+    }
+
+    #[test]
     fn workspace_rows_preserve_empty_titles_for_relaunch() {
         let rows = parse_workspace_rows(
             r#"tell application "Ghostty"
@@ -1902,6 +2296,58 @@ end tell
     }
 
     #[test]
+    fn captured_titles_strip_transient_prefixes() {
+        assert_eq!(
+            normalize_captured_tab_title("⠐ 🔔 dither-motion"),
+            "dither-motion"
+        );
+        assert_eq!(normalize_captured_tab_title("🔔 dither"), "dither");
+        assert_eq!(normalize_captured_tab_title("  api  "), "api");
+    }
+
+    #[test]
+    fn selected_window_title_overrides_dynamic_selected_tab_title_when_ax_is_unavailable() {
+        let mut rows = vec![
+            captured_surface(1, "dither-motion", true, "dither"),
+            captured_surface(2, "api", false, "dither"),
+        ];
+
+        apply_best_available_tab_titles(&mut rows, None);
+
+        assert_eq!(rows[0].title, "dither");
+        assert_eq!(rows[1].title, "api");
+    }
+
+    #[test]
+    fn accessibility_titles_are_preferred_when_available() {
+        let mut rows = vec![
+            captured_surface(1, "dither-motion", true, "dither"),
+            captured_surface(2, "🔔 api", false, "dither"),
+        ];
+        let visible_titles = BTreeMap::from([(1, "dither".to_string()), (2, "worker".to_string())]);
+
+        apply_best_available_tab_titles(&mut rows, Some(&visible_titles));
+
+        assert_eq!(rows[0].title, "dither");
+        assert_eq!(rows[1].title, "worker");
+    }
+
+    #[test]
+    fn accessibility_inference_prefers_exact_tab_groups() {
+        let elements = vec![
+            accessibility_element("AXButton", "Close", 10, 12, 14, 14),
+            accessibility_element("AXRadioButton", "⠐ dither", 68, 24, 96, 28),
+            accessibility_element("AXRadioButton", "🔔 worker", 172, 24, 104, 28),
+            accessibility_element("AXStaticText", "Output", 90, 160, 64, 20),
+        ];
+
+        let titles = infer_tab_titles_from_accessibility_elements(&elements, 2).unwrap();
+
+        assert_eq!(titles.get(&1), Some(&"dither".to_string()));
+        assert_eq!(titles.get(&2), Some(&"worker".to_string()));
+    }
+
+    #[test]
     fn custom_workspace_features_require_legacy_launch() {
         assert!(workspace_requires_true_legacy_launch(
             r#"tell application "Ghostty"
@@ -1917,6 +2363,68 @@ end tell"#
     set initial working directory of cfg1 to "/tmp/project"
 end tell"#
         ));
+    }
+
+    #[test]
+    fn launch_plan_prefers_legacy_for_custom_commands() {
+        let script = r#"tell application "Ghostty"
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set command of cfg1 to "npm run dev"
+end tell"#;
+
+        let rows = parse_workspace_rows(script);
+        assert_eq!(
+            plan_workspace_launch(script, &rows),
+            WorkspaceLaunchMode::DirectLegacy
+        );
+    }
+
+    #[test]
+    fn launch_plan_uses_split_mode_for_split_workspaces() {
+        let script = r#"tell application "Ghostty"
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set win to new window with configuration cfg1
+    set p1 to split p0 direction right with configuration cfg2
+end tell"#;
+
+        let rows = parse_workspace_rows(script);
+        assert_eq!(
+            plan_workspace_launch(script, &rows),
+            WorkspaceLaunchMode::DirectSplit
+        );
+    }
+
+    #[test]
+    fn launch_plan_uses_reconstructed_mode_for_plain_workspaces() {
+        let script = r#"tell application "Ghostty"
+    activate
+
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set win to new window with configuration cfg1
+    set term1 to focused terminal of selected tab of win
+end tell"#;
+
+        let rows = parse_workspace_rows(script);
+        assert_eq!(
+            plan_workspace_launch(script, &rows),
+            WorkspaceLaunchMode::Reconstructed
+        );
+    }
+
+    #[test]
+    fn launch_plan_falls_back_when_rows_cannot_be_reconstructed() {
+        let script = r#"tell application "Ghostty"
+    activate
+end tell"#;
+
+        let rows = parse_workspace_rows(script);
+        assert_eq!(
+            plan_workspace_launch(script, &rows),
+            WorkspaceLaunchMode::DirectFallback
+        );
     }
 
     #[test]
@@ -1988,6 +2496,18 @@ end tell"#
 
         assert!(error.contains("workspace 'beta' already exists"));
         let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn format_workspace_list_is_empty_when_no_workspaces_exist() {
+        assert_eq!(format_workspace_list(&[]), "No workspaces saved.");
+    }
+
+    #[test]
+    fn format_workspace_list_renders_one_name_per_line() {
+        let list = format_workspace_list(&[workspace("alpha"), workspace("beta")]);
+
+        assert_eq!(list, "Workspaces:\n  - alpha\n  - beta");
     }
 
     #[test]
@@ -2223,6 +2743,55 @@ end tell"#
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("gtab-{name}-{nanos}"))
+    }
+
+    fn captured_surface(
+        tab_index: usize,
+        title: &str,
+        selected: bool,
+        window_title: &str,
+    ) -> CapturedTabSurface {
+        CapturedTabSurface {
+            tab_index,
+            pane_index: 1,
+            terminal_id: format!("term-{tab_index}"),
+            working_dir: format!("/tmp/tab-{tab_index}"),
+            title: title.to_string(),
+            rect: CapturedPaneRect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            selected,
+            window_title: window_title.to_string(),
+        }
+    }
+
+    fn workspace(name: &str) -> super::Workspace {
+        super::Workspace {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/tmp/{name}.applescript")),
+            tabs: vec![],
+        }
+    }
+
+    fn accessibility_element(
+        role: &str,
+        name: &str,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> AccessibilityElement {
+        AccessibilityElement {
+            role: role.to_string(),
+            name: name.to_string(),
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
