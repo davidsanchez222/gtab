@@ -15,13 +15,7 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
-revision="${1:-$(git rev-parse HEAD)}"
-output="${2:-Formula/gtab.rb}"
-
-if [[ $# -eq 0 ]] && [[ -n "$(git status --porcelain)" ]]; then
-  echo "working tree is dirty; commit the release changes first or pass an explicit revision" >&2
-  exit 1
-fi
+output="${1:-Formula/gtab.rb}"
 
 mkdir -p "$(dirname "$output")"
 
@@ -30,8 +24,7 @@ class Gtab < Formula
   desc "Ghostty tab workspace manager with an interactive TUI"
   homepage "https://github.com/Franvy/gtab"
   url "https://github.com/Franvy/gtab.git",
-      tag: "v${version}",
-      revision: "${revision}"
+      tag: "v${version}"
   version "${version}"
   license "MIT"
   head "https://github.com/Franvy/gtab.git", branch: "main"
@@ -77,4 +70,4 @@ class Gtab < Formula
 end
 EOF
 
-echo "Wrote ${output} for v${version} @ ${revision}"
+echo "Wrote ${output} for v${version}"

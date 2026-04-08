@@ -162,6 +162,14 @@ This works only when Ghostty is focused. It is fast because it is effectively th
 
 **Tradeoff:** this shortcut is not safe inside full-screen interactive programs like Claude Code, vim, or fzf — it will type the literal text `gtab` into them. Quit those programs first, or use `gtab <name>` from a clean shell prompt.
 
+If your Ghostty config is managed by Nix/Home Manager or another read-only setup, `gtab init` will still write `~/.config/gtab/ghostty-shortcut.conf`, then tell you to add this line to your Ghostty config source manually:
+
+```conf
+config-file = "/Users/you/.config/gtab/ghostty-shortcut.conf"
+```
+
+After that, rebuild/apply your config and reload or restart Ghostty.
+
 ---
 
 ## gtab vs tmux
@@ -194,6 +202,10 @@ That is why `gtab` is lightweight: it stores layout metadata, not live terminal 
 Ghostty keybindings do not have an action for running external commands. The `text` action sends a string to the active shell — which is effectively the same as typing it yourself.
 
 See: [ghostty.org/docs/config/keybind](https://ghostty.org/docs/config/keybind)
+
+### Why doesn't gtab edit my Nix/Home Manager config directly?
+
+Nix/Home Manager usually generates Ghostty config from a declaration source instead of a normal writable file. `gtab` can safely generate its own managed include file, but it cannot reliably edit every user's `home.nix`, flake module, or repo layout without risking a bad config change. In those setups, `gtab init` writes the managed include file and tells you exactly which `config-file = ...` line to add to your config source.
 
 ### Does gtab support split panes?
 

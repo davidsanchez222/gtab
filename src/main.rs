@@ -3,7 +3,10 @@ use clap::Parser;
 use gtab::{
     app,
     cli::{Cli, Commands},
-    core::{AppEnv, format_settings, format_workspace_list},
+    core::{
+        AppEnv, GhosttyShortcutApplyResult, GhosttyShortcutApplyStatus, format_settings,
+        format_workspace_list,
+    },
 };
 
 fn main() {
@@ -88,22 +91,12 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
             bail!("global_shortcut has been removed; gtab only uses the Ghostty-local shortcut now")
         }
         (Some("ghostty_shortcut"), Some(shortcut)) => {
-            let sync = env.set_ghostty_shortcut(shortcut)?;
+            let result = env.set_ghostty_shortcut(shortcut)?;
             println!("Set ghostty_shortcut = {}", env.ghostty_shortcut_display());
             if env.ghostty_shortcut_display() == "off" {
-                println!("Removed managed Ghostty shortcut reference from:");
-                println!("  {}", sync.config_path.display());
-                println!("Ghostty-local shortcut is now disabled.");
-                println!(
-                    "Reload Ghostty config or restart Ghostty to stop Cmd+G from typing `gtab`."
-                );
+                print_disabled_shortcut_result(&result);
             } else {
-                println!(
-                    "Managed Ghostty keybind file: {}",
-                    sync.include_path.display()
-                );
-                println!("This shortcut types `gtab` into the focused Ghostty shell.");
-                println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
+                print_enabled_shortcut_result(&result);
             }
             Ok(())
         }
@@ -113,11 +106,64 @@ fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Resul
 }
 
 fn handle_init(env: &mut AppEnv) -> Result<()> {
-    let sync = env.init_shortcuts()?;
+    let result = env.init_shortcuts()?;
     println!("Initialized Ghostty-local shortcut.");
-    println!("  ghostty_shortcut = {}", sync.shortcut);
-    println!("  ghostty_config = {}", sync.config_path.display());
-    println!("  ghostty_include = {}", sync.include_path.display());
-    println!("Reload Ghostty config or restart Ghostty, then press Cmd+G inside Ghostty.");
+    println!("  ghostty_shortcut = {}", result.sync.shortcut);
+    println!("  ghostty_config = {}", result.sync.config_path.display());
+    println!("  ghostty_include = {}", result.sync.include_path.display());
+
+    if result.status == GhosttyShortcutApplyStatus::ManualConfigRequired {
+        print_manual_config_addition(&result);
+    } else {
+        println!("Reload Ghostty config or restart Ghostty, then press Cmd+G inside Ghostty.");
+    }
+
     Ok(())
+}
+
+fn print_enabled_shortcut_result(result: &GhosttyShortcutApplyResult) {
+    println!(
+        "Managed Ghostty keybind file: {}",
+        result.sync.include_path.display()
+    );
+    println!("This shortcut types `gtab` into the focused Ghostty shell.");
+
+    if result.status == GhosttyShortcutApplyStatus::ManualConfigRequired {
+        print_manual_config_addition(result);
+    } else {
+        println!("Reload Ghostty config or restart Ghostty to apply the shortcut.");
+    }
+}
+
+fn print_disabled_shortcut_result(result: &GhosttyShortcutApplyResult) {
+    if result.status == GhosttyShortcutApplyStatus::ManualConfigRemovalRequired {
+        println!(
+            "Removed the local managed Ghostty shortcut file: {}",
+            result.sync.include_path.display()
+        );
+        print_manual_config_removal(result);
+    } else {
+        println!("Removed managed Ghostty shortcut reference from:");
+        println!("  {}", result.sync.config_path.display());
+        println!("Ghostty-local shortcut is now disabled.");
+        println!("Reload Ghostty config or restart Ghostty to stop Cmd+G from typing `gtab`.");
+    }
+}
+
+fn print_manual_config_addition(result: &GhosttyShortcutApplyResult) {
+    if let Some(reason) = &result.reason {
+        println!("{reason}");
+    }
+    println!("Add this line to your Ghostty config source (for example Nix/Home Manager):");
+    println!("  {}", result.include_config_line());
+    println!("Rebuild/apply your config, then reload or restart Ghostty.");
+}
+
+fn print_manual_config_removal(result: &GhosttyShortcutApplyResult) {
+    if let Some(reason) = &result.reason {
+        println!("{reason}");
+    }
+    println!("Remove this line from your Ghostty config source (for example Nix/Home Manager):");
+    println!("  {}", result.include_config_line());
+    println!("Rebuild/apply your config, then reload or restart Ghostty to disable Cmd+G.");
 }

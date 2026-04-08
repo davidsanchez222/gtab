@@ -145,17 +145,31 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                     },
                     Action::SetGhosttyShortcut(shortcut) => {
                         match env.set_ghostty_shortcut(&shortcut) {
-                            Ok(sync) => {
+                            Ok(result) => {
                                 app.dialog = app.shortcut_return_dialog.clone();
                                 app.shortcut_input.clear();
-                                if sync.shortcut == "off" {
+                                if result.sync.shortcut == "off" {
+                                    if result.status
+                                        == crate::core::GhosttyShortcutApplyStatus::ManualConfigRemovalRequired
+                                    {
+                                        app.set_success(
+                                            "Shortcut file removed. Also remove the include from your Ghostty config source.",
+                                        );
+                                    } else {
+                                        app.set_success(
+                                            "Ghostty-local shortcut disabled. Run `gtab init` to restore Cmd+G.",
+                                        );
+                                    }
+                                } else if result.status
+                                    == crate::core::GhosttyShortcutApplyStatus::ManualConfigRequired
+                                {
                                     app.set_success(
-                                    "Ghostty-local shortcut disabled. Run `gtab init` to restore Cmd+G.",
-                                );
+                                        "Shortcut file updated. Add the include to your Ghostty config source, then rebuild.",
+                                    );
                                 } else {
                                     app.set_success(format!(
                                     "Ghostty-local shortcut saved as {}. Reload Ghostty config to apply it.",
-                                    sync.shortcut
+                                    result.sync.shortcut
                                 ));
                                 }
                             }
@@ -223,13 +237,8 @@ impl TerminalSession {
     fn start() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            Hide
-        )
-        .context("failed to enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)
+            .context("failed to enter alternate screen")?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
             .context("failed to initialize terminal backend")?;
         Ok(Self {

@@ -162,6 +162,14 @@ keybind = cmd+g=text:gtab\x0d
 
 **注意：** 这个快捷键在 Claude Code、vim、fzf 等交互式全屏程序里不安全——它会把 `gtab` 这几个字母打到程序里。在干净的 shell 提示符下使用，或者直接运行 `gtab <name>`。
 
+如果你的 Ghostty 配置由 Nix/Home Manager 或其他只读方案管理，`gtab init` 仍然会写出 `~/.config/gtab/ghostty-shortcut.conf`，然后提示你把下面这行手动加到 Ghostty 的配置源里：
+
+```conf
+config-file = "/Users/you/.config/gtab/ghostty-shortcut.conf"
+```
+
+之后重新应用配置，再重载或重启 Ghostty 即可。
+
 ---
 
 ## gtab 和 tmux 的区别
@@ -194,6 +202,10 @@ keybind = cmd+g=text:gtab\x0d
 Ghostty 的 keybind action 没有"直接执行外部命令"的能力。`text` action 会把字符串发送到当前 shell——效果几乎等同于你自己手动输入。
 
 参考：[ghostty.org/docs/config/keybind](https://ghostty.org/docs/config/keybind)
+
+### 为什么 gtab 不直接修改我的 Nix/Home Manager 配置？
+
+Nix/Home Manager 一般不是让你直接改 Ghostty 最终生成出来的配置文件，而是改声明式配置源。`gtab` 可以稳定地生成自己的托管 include 文件，但无法可靠地自动修改每个用户各不相同的 `home.nix`、flake 模块或仓库结构，否则很容易把配置改坏。所以在这类环境下，`gtab init` 会先写好 include 文件，再明确告诉你该把哪一行 `config-file = ...` 加到配置源里。
 
 ### gtab 支持分屏吗？
 

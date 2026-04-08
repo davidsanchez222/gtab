@@ -4,7 +4,7 @@ use std::ffi::{CStr, c_void};
 use std::{
     collections::BTreeSet,
     env, fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -14,12 +14,14 @@ use std::{
 const APPLE_EXT: &str = "applescript";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "cmd+g";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
+const GHOSTTY_EXTERNAL_CONFIG_REASON: &str = "Ghostty config appears to be managed externally (for example by Nix/Home Manager) and was not modified.";
 const GHOSTTY_DISCOVERY_ATTEMPTS: usize = 100;
 const GHOSTTY_DISCOVERY_DELAY_MS: u64 = 50;
 const LEGACY_LAUNCHER_SCRIPT_NAME: &str = "launcher.sh";
 const LEGACY_HOTKEY_SERVICE_LABEL: &str = "com.franvy.gtab.hotkey";
 const LEGACY_HOTKEY_PLIST_NAME: &str = "com.franvy.gtab.hotkey.plist";
 const LEGACY_HOTKEY_LOG_NAME: &str = "gtab-hotkey.log";
+const NIX_STORE_ROOT: &str = "/nix/store";
 #[cfg(target_os = "macos")]
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
@@ -141,18 +143,18 @@ impl AppEnv {
         self.write_config()
     }
 
-    pub fn set_ghostty_shortcut(&mut self, shortcut: &str) -> Result<GhosttyShortcutSync> {
+    pub fn set_ghostty_shortcut(&mut self, shortcut: &str) -> Result<GhosttyShortcutApplyResult> {
         self.config.ghostty_shortcut = normalize_ghostty_shortcut(shortcut)?;
         self.write_config()?;
         self.sync_ghostty_shortcut()
     }
 
-    pub fn ensure_ghostty_shortcut(&self) -> Result<bool> {
+    pub fn ensure_ghostty_shortcut(&self) -> Result<GhosttyShortcutApplyResult> {
         let sync = self.preview_ghostty_shortcut_sync();
         self.sync_ghostty_shortcut_files(&sync)
     }
 
-    pub fn init_shortcuts(&mut self) -> Result<GhosttyShortcutSync> {
+    pub fn init_shortcuts(&mut self) -> Result<GhosttyShortcutApplyResult> {
         self.config.ghostty_shortcut = DEFAULT_GHOSTTY_SHORTCUT.to_string();
         self.write_config()?;
         let sync = self.sync_ghostty_shortcut()?;
@@ -199,8 +201,7 @@ impl AppEnv {
     pub fn save_current_window(&self, name: &str) -> Result<PathBuf> {
         let path = self.workspace_path(name)?;
         let script = capture_workspace_script()?;
-        fs::write(&path, &script)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        fs::write(&path, &script).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
 
@@ -365,24 +366,65 @@ impl AppEnv {
         }
     }
 
-    fn sync_ghostty_shortcut(&self) -> Result<GhosttyShortcutSync> {
+    fn sync_ghostty_shortcut(&self) -> Result<GhosttyShortcutApplyResult> {
         let sync = self.preview_ghostty_shortcut_sync();
-        self.sync_ghostty_shortcut_files(&sync)?;
-        Ok(sync)
+        self.sync_ghostty_shortcut_files(&sync)
     }
 
-    fn sync_ghostty_shortcut_files(&self, sync: &GhosttyShortcutSync) -> Result<bool> {
+    fn sync_ghostty_shortcut_files(
+        &self,
+        sync: &GhosttyShortcutSync,
+    ) -> Result<GhosttyShortcutApplyResult> {
         if is_shortcut_disabled(&self.config.ghostty_shortcut) {
-            let config_changed =
+            let config_result =
                 sync_ghostty_include_reference(&sync.config_path, &sync.include_path, false)?;
             let include_removed = remove_file_if_exists(&sync.include_path)?;
-            return Ok(config_changed || include_removed);
+            let (status, reason) = match config_result {
+                GhosttyConfigSync::Updated => (GhosttyShortcutApplyStatus::UpdatedConfig, None),
+                GhosttyConfigSync::Unchanged => {
+                    let status = if include_removed {
+                        GhosttyShortcutApplyStatus::UpdatedConfig
+                    } else {
+                        GhosttyShortcutApplyStatus::AlreadyConfigured
+                    };
+                    (status, None)
+                }
+                GhosttyConfigSync::ManualConfigRequired { reason } => (
+                    GhosttyShortcutApplyStatus::ManualConfigRemovalRequired,
+                    Some(reason),
+                ),
+            };
+            return Ok(GhosttyShortcutApplyResult {
+                sync: sync.clone(),
+                status,
+                reason,
+            });
         }
 
         let include_changed = self.write_ghostty_shortcut_include(&sync.include_path)?;
-        let config_changed =
+        let config_result =
             sync_ghostty_include_reference(&sync.config_path, &sync.include_path, true)?;
-        Ok(config_changed || include_changed)
+        let (status, reason) = match config_result {
+            GhosttyConfigSync::Updated => (GhosttyShortcutApplyStatus::UpdatedConfig, None),
+            GhosttyConfigSync::Unchanged => {
+                let status = if include_changed {
+                    GhosttyShortcutApplyStatus::UpdatedConfig
+                } else {
+                    GhosttyShortcutApplyStatus::AlreadyConfigured
+                };
+                (status, None)
+            }
+            GhosttyConfigSync::ManualConfigRequired { reason } => (
+                GhosttyShortcutApplyStatus::ManualConfigRequired,
+                Some(reason),
+            ),
+        };
+
+        Ok(GhosttyShortcutApplyResult {
+            sync: sync.clone(),
+            status,
+            reason,
+        })
     }
 
     fn write_ghostty_shortcut_include(&self, path: &Path) -> Result<bool> {
@@ -911,7 +953,10 @@ print('\n'.join(out))
         .context("failed to spawn python3 for workspace script generation")?;
 
     {
-        let stdin = child.stdin.as_mut().context("failed to open python3 stdin")?;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open python3 stdin")?;
         stdin
             .write_all(raw.as_bytes())
             .context("failed to write tab data to python3")?;
@@ -1024,9 +1069,8 @@ end tell"#,
         w = frame.width,
         h = frame.height
     );
-    run_osascript(&script).context(
-        "failed to reposition the Ghostty window (check Accessibility permissions)",
-    )?;
+    run_osascript(&script)
+        .context("failed to reposition the Ghostty window (check Accessibility permissions)")?;
     Ok(())
 }
 
@@ -1096,7 +1140,6 @@ end tell"#,
 
     parse_window_frame(&output)
 }
-
 
 fn build_workspace_followup_script(window_id: &str, rows: &[TabRow]) -> Option<String> {
     let first_row = rows.first()?;
@@ -1257,9 +1300,7 @@ fn workspace_requires_true_legacy_launch(script: &str) -> bool {
 
 fn workspace_has_splits(script: &str) -> bool {
     script.lines().map(str::trim).any(|line| {
-        line.starts_with("set p")
-            && line.contains(" split ")
-            && line.contains(" direction ")
+        line.starts_with("set p") && line.contains(" split ") && line.contains(" direction ")
     })
 }
 
@@ -1351,11 +1392,15 @@ fn build_ghostty_shortcut_include(shortcut: &str) -> String {
     )
 }
 
+fn render_ghostty_include_config_line(include_path: &Path) -> String {
+    format!("config-file = \"{}\"", include_path.display())
+}
+
 fn sync_ghostty_include_reference(
     config_path: &Path,
     include_path: &Path,
     enabled: bool,
-) -> Result<bool> {
+) -> Result<GhosttyConfigSync> {
     if enabled {
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)
@@ -1366,13 +1411,16 @@ fn sync_ghostty_include_reference(
     let existing = match fs::read_to_string(config_path) {
         Ok(existing) => existing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if enabled && ghostty_config_is_externally_managed(config_path) {
+                return Ok(GhosttyConfigSync::ManualConfigRequired {
+                    reason: GHOSTTY_EXTERNAL_CONFIG_REASON.to_string(),
+                });
+            }
             if enabled {
                 let next = render_ghostty_config_with_gtab_include(&[], include_path);
-                fs::write(config_path, next)
-                    .with_context(|| format!("failed to write {}", config_path.display()))?;
-                return Ok(true);
+                return write_ghostty_config(config_path, next);
             }
-            return Ok(false);
+            return Ok(GhosttyConfigSync::Unchanged);
         }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
@@ -1388,12 +1436,77 @@ fn sync_ghostty_include_reference(
     };
 
     if next == existing {
-        return Ok(false);
+        return Ok(GhosttyConfigSync::Unchanged);
     }
 
-    fs::write(config_path, next)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(true)
+    if ghostty_config_is_externally_managed(config_path) {
+        return Ok(GhosttyConfigSync::ManualConfigRequired {
+            reason: GHOSTTY_EXTERNAL_CONFIG_REASON.to_string(),
+        });
+    }
+
+    write_ghostty_config(config_path, next)
+}
+
+fn write_ghostty_config(config_path: &Path, next: String) -> Result<GhosttyConfigSync> {
+    match fs::write(config_path, next) {
+        Ok(()) => Ok(GhosttyConfigSync::Updated),
+        Err(error) if is_manual_config_error(&error) => {
+            Ok(GhosttyConfigSync::ManualConfigRequired {
+                reason: GHOSTTY_EXTERNAL_CONFIG_REASON.to_string(),
+            })
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to write {}", config_path.display()))
+        }
+    }
+}
+
+fn ghostty_config_is_externally_managed(config_path: &Path) -> bool {
+    if config_path.starts_with(NIX_STORE_ROOT) {
+        return true;
+    }
+
+    resolve_symlink_chain(config_path, 8)
+        .map(|path| path.starts_with(NIX_STORE_ROOT))
+        .unwrap_or(false)
+}
+
+fn resolve_symlink_chain(path: &Path, max_depth: usize) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+
+    for _ in 0..max_depth {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(current),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", current.display()));
+            }
+        };
+
+        if !metadata.file_type().is_symlink() {
+            return Ok(current);
+        }
+
+        let target = fs::read_link(&current)
+            .with_context(|| format!("failed to read symlink {}", current.display()))?;
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+
+    Ok(current)
+}
+
+fn is_manual_config_error(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::PermissionDenied)
+        || matches!(error.raw_os_error(), Some(30))
 }
 
 fn strip_gtab_include_reference(lines: &[String], include_path: &Path) -> Vec<String> {
@@ -1427,7 +1540,8 @@ fn render_ghostty_config_with_gtab_include(lines: &[String], include_path: &Path
     }
 
     next.push_str("# gtab managed include\n");
-    next.push_str(&format!("config-file = \"{}\"\n", include_path.display()));
+    next.push_str(&render_ghostty_include_config_line(include_path));
+    next.push('\n');
     next
 }
 
@@ -1476,6 +1590,34 @@ pub struct GhosttyShortcutSync {
     pub config_path: PathBuf,
     pub include_path: PathBuf,
     pub shortcut: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GhosttyShortcutApplyStatus {
+    UpdatedConfig,
+    AlreadyConfigured,
+    ManualConfigRequired,
+    ManualConfigRemovalRequired,
+}
+
+#[derive(Clone, Debug)]
+pub struct GhosttyShortcutApplyResult {
+    pub sync: GhosttyShortcutSync,
+    pub status: GhosttyShortcutApplyStatus,
+    pub reason: Option<String>,
+}
+
+impl GhosttyShortcutApplyResult {
+    pub fn include_config_line(&self) -> String {
+        render_ghostty_include_config_line(&self.sync.include_path)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GhosttyConfigSync {
+    Updated,
+    Unchanged,
+    ManualConfigRequired { reason: String },
 }
 
 fn run_osascript(script: &str) -> Result<String> {
@@ -1570,13 +1712,17 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEnv, Config, TabRow, WindowFrame, apple_escape, build_ghostty_shortcut_include,
-        build_workspace_followup_script, build_workspace_script,
-        parse_window_frame, parse_workspace_rows, parse_workspace_tabs,
-        should_switch_to_ascii_input_source, sync_ghostty_include_reference,
-        workspace_has_splits, workspace_requires_true_legacy_launch,
+        AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame,
+        apple_escape, build_ghostty_shortcut_include, build_workspace_followup_script,
+        build_workspace_script, parse_window_frame, parse_workspace_rows, parse_workspace_tabs,
+        render_ghostty_include_config_line, should_switch_to_ascii_input_source,
+        sync_ghostty_include_reference, workspace_has_splits,
+        workspace_requires_true_legacy_launch,
     };
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
+
+    #[cfg(unix)]
+    use std::os::unix::{fs::symlink, prelude::PermissionsExt};
 
     fn test_env(name: &str) -> AppEnv {
         let base_dir = tempfile_path(name);
@@ -1863,9 +2009,9 @@ end tell"#
         let config_path = tempfile_path("ghostty-config-enable");
         let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
 
-        let changed = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+        let sync = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
 
-        assert!(changed);
+        assert_eq!(sync, GhosttyConfigSync::Updated);
         assert_eq!(
             std::fs::read_to_string(&config_path).unwrap(),
             "# gtab managed include\nconfig-file = \"/tmp/gtab-shortcut.conf\"\n"
@@ -1878,9 +2024,9 @@ end tell"#
         let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
 
         sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
-        let changed = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+        let sync = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
 
-        assert!(!changed);
+        assert_eq!(sync, GhosttyConfigSync::Unchanged);
         assert_eq!(
             std::fs::read_to_string(&config_path).unwrap(),
             "# gtab managed include\nconfig-file = \"/tmp/gtab-shortcut.conf\"\n"
@@ -1903,9 +2049,9 @@ end tell"#
         )
         .unwrap();
 
-        let changed = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+        let sync = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
 
-        assert!(changed);
+        assert_eq!(sync, GhosttyConfigSync::Updated);
         assert_eq!(
             std::fs::read_to_string(&config_path).unwrap(),
             concat!(
@@ -1932,9 +2078,9 @@ end tell"#
         )
         .unwrap();
 
-        let changed = sync_ghostty_include_reference(&config_path, include_path, false).unwrap();
+        let sync = sync_ghostty_include_reference(&config_path, include_path, false).unwrap();
 
-        assert!(changed);
+        assert_eq!(sync, GhosttyConfigSync::Updated);
         assert_eq!(
             std::fs::read_to_string(&config_path).unwrap(),
             concat!(
@@ -1945,11 +2091,146 @@ end tell"#
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn enabling_ghostty_sync_updates_writable_symlink_target() {
+        let dir = tempdir_path("ghostty-config-symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let target_path = dir.join("config");
+        let link_path = dir.join("config.ghostty");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+        fs::write(&target_path, "font-size = 14\n").unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let sync = sync_ghostty_include_reference(&link_path, include_path, true).unwrap();
+
+        assert_eq!(sync, GhosttyConfigSync::Updated);
+        assert_eq!(
+            fs::read_to_string(&target_path).unwrap(),
+            "font-size = 14\n\n# gtab managed include\nconfig-file = \"/tmp/gtab-shortcut.conf\"\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_ghostty_sync_reports_manual_config_for_nix_symlink_chain() {
+        let dir = tempdir_path("ghostty-config-nix");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config");
+        let config_ghostty_path = dir.join("config.ghostty");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+        symlink(
+            "/nix/store/gtab-test-home-manager/.config/ghostty/config",
+            &config_path,
+        )
+        .unwrap();
+        symlink("config", &config_ghostty_path).unwrap();
+
+        let sync =
+            sync_ghostty_include_reference(&config_ghostty_path, include_path, true).unwrap();
+
+        assert_eq!(
+            sync,
+            GhosttyConfigSync::ManualConfigRequired {
+                reason: super::GHOSTTY_EXTERNAL_CONFIG_REASON.to_string(),
+            }
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_ghostty_sync_falls_back_to_manual_config_for_read_only_file() {
+        let config_path = tempfile_path("ghostty-config-read-only");
+        let include_path = std::path::Path::new("/tmp/gtab-shortcut.conf");
+        fs::write(&config_path, "font-size = 14\n").unwrap();
+        let mut permissions = fs::metadata(&config_path).unwrap().permissions();
+        permissions.set_mode(0o444);
+        fs::set_permissions(&config_path, permissions).unwrap();
+
+        let sync = sync_ghostty_include_reference(&config_path, include_path, true).unwrap();
+
+        assert_eq!(
+            sync,
+            GhosttyConfigSync::ManualConfigRequired {
+                reason: super::GHOSTTY_EXTERNAL_CONFIG_REASON.to_string(),
+            }
+        );
+
+        let mut permissions = fs::metadata(&config_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&config_path, permissions).unwrap();
+        let _ = fs::remove_file(&config_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_shortcuts_reports_manual_setup_when_ghostty_config_is_nix_managed() {
+        let env = test_env("init-shortcuts-nix");
+        let xdg_dir = tempdir_path("xdg-dir-nix");
+        let ghostty_dir = xdg_dir.join("ghostty");
+        fs::create_dir_all(&ghostty_dir).unwrap();
+        let config_path = ghostty_dir.join("config");
+        let config_ghostty_path = ghostty_dir.join("config.ghostty");
+        symlink(
+            "/nix/store/gtab-test-home-manager/.config/ghostty/config",
+            &config_path,
+        )
+        .unwrap();
+        symlink("config", &config_ghostty_path).unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("HOME", &xdg_dir);
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
+        }
+
+        let mut env = env;
+        let result = env.init_shortcuts().unwrap();
+
+        assert_eq!(
+            result.status,
+            GhosttyShortcutApplyStatus::ManualConfigRequired
+        );
+        assert_eq!(
+            result.include_config_line(),
+            render_ghostty_include_config_line(&result.sync.include_path)
+        );
+        assert!(result.sync.include_path.exists());
+        assert_eq!(result.sync.config_path, config_ghostty_path);
+
+        restore_env_var("HOME", old_home);
+        restore_env_var("XDG_CONFIG_HOME", old_xdg);
+        let _ = fs::remove_dir_all(&env.base_dir);
+        let _ = fs::remove_dir_all(&xdg_dir);
+    }
+
     fn tempfile_path(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("gtab-{name}-{nanos}.tmp"))
+    }
+
+    fn tempdir_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("gtab-{name}-{nanos}"))
+    }
+
+    fn restore_env_var(key: &str, value: Option<std::ffi::OsString>) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }
