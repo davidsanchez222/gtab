@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, c_void};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -115,7 +115,12 @@ pub struct AppEnv {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 struct TabRow {
+    // Fields are read by tests and by the cfg(test) `build_workspace_script`
+    // helper. Production code only checks `rows.len()` via `plan_workspace_launch`
+    // today, but keeping the structured data lets future launch-mode work
+    // build on a single parsed representation.
     working_dir: String,
     title: String,
 }
@@ -124,7 +129,6 @@ struct TabRow {
 enum WorkspaceLaunchMode {
     DirectLegacy,
     DirectSplit,
-    Reconstructed,
     DirectFallback,
 }
 
@@ -136,22 +140,10 @@ struct CapturedTabSurface {
     working_dir: String,
     title: String,
     rect: CapturedPaneRect,
-    selected: bool,
-    window_title: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CapturedPaneRect {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AccessibilityElement {
-    role: String,
-    name: String,
     x: i32,
     y: i32,
     width: i32,
@@ -337,11 +329,6 @@ impl AppEnv {
                 if let Ok(window_id) = wait_for_new_ghostty_window_id(&existing_window_ids) {
                     let _ = reposition_ghostty_window(&window_id, frame);
                 }
-                self.finish_workspace_launch()?;
-                Ok(None)
-            }
-            WorkspaceLaunchMode::Reconstructed => {
-                launch_workspace_rows_in_background(&rows, frame)?;
                 self.finish_workspace_launch()?;
                 Ok(None)
             }
@@ -841,19 +828,17 @@ fn capture_workspace_script() -> Result<String> {
         r#"set D to (ASCII character 9)
 tell application "Ghostty"
   set win to front window
-  set winTitle to name of win
   set tabList to tabs of win
   set allLines to {}
   repeat with ti from 1 to count of tabList
     set t to item ti of tabList
     set termList to every terminal of t
     set ttl to name of t
-    set isSelected to selected of t
     if (count of termList) = 1 then
       set term to item 1 of termList
       set wd to working directory of term
       if wd = "" then set wd to POSIX path of (path to home folder)
-      set end of allLines to (ti as text) & D & "1" & D & (id of term as text) & D & wd & D & ttl & D & "0,0,1,1" & D & (isSelected as text) & D & winTitle
+      set end of allLines to (ti as text) & D & "1" & D & (id of term as text) & D & wd & D & ttl & D & "0,0,1,1"
     else
       repeat with pi from 1 to count of termList
         set term to item pi of termList
@@ -875,7 +860,7 @@ tell application "Ghostty"
             set posStr to ((item 1 of pos) as text) & "," & ((item 2 of pos) as text) & "," & ((item 1 of sz) as text) & "," & ((item 2 of sz) as text)
           end try
         end tell
-        set end of allLines to (ti as text) & D & (pi as text) & D & (id of term as text) & D & wd & D & ttl & D & posStr & D & (isSelected as text) & D & winTitle
+        set end of allLines to (ti as text) & D & (pi as text) & D & (id of term as text) & D & wd & D & ttl & D & posStr
       end repeat
     end if
   end repeat
@@ -889,18 +874,11 @@ end tell"#,
         bail!("could not read Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
 
-    let mut captured = parse_captured_tab_surfaces(&raw);
+    let captured = parse_captured_tab_surfaces(&raw);
     if captured.is_empty() {
         bail!("could not parse Ghostty tabs (make sure Ghostty is the frontmost app)");
     }
 
-    let tab_count = captured
-        .iter()
-        .map(|surface| surface.tab_index)
-        .max()
-        .unwrap_or(0);
-    let visible_titles = capture_frontmost_ghostty_tab_titles_via_ax(tab_count);
-    apply_best_available_tab_titles(&mut captured, visible_titles.as_ref());
     let normalized = serialize_captured_tab_surfaces(&captured);
 
     // Phase 2: reconstruct split trees from positions and generate restore script
@@ -1039,15 +1017,6 @@ fn parse_captured_tab_surface(line: &str) -> Option<CapturedTabSurface> {
     let working_dir = parts.next()?.to_string();
     let title = normalize_captured_tab_title(parts.next()?);
     let rect = parse_captured_pane_rect(parts.next()?)?;
-    let selected = parts
-        .next()
-        .map(|value| matches!(value.trim(), "true" | "yes" | "1"))
-        .unwrap_or(false);
-    let window_title = parts
-        .next()
-        .map(normalize_captured_tab_title)
-        .unwrap_or_default();
-
     Some(CapturedTabSurface {
         tab_index,
         pane_index,
@@ -1055,8 +1024,6 @@ fn parse_captured_tab_surface(line: &str) -> Option<CapturedTabSurface> {
         working_dir,
         title,
         rect,
-        selected,
-        window_title,
     })
 }
 
@@ -1091,51 +1058,20 @@ fn serialize_captured_tab_surfaces(rows: &[CapturedTabSurface]) -> String {
         out.push('\t');
         out.push_str(&row.working_dir);
         out.push('\t');
-        out.push_str(&row.title);
+        let title_to_write = if looks_like_shell_default_title(&row.title, &row.working_dir) {
+            ""
+        } else {
+            &row.title
+        };
+        out.push_str(title_to_write);
         out.push('\t');
         out.push_str(&format!(
             "{},{},{},{}",
             row.rect.x, row.rect.y, row.rect.width, row.rect.height
         ));
-        out.push('\t');
-        out.push_str(if row.selected { "true" } else { "false" });
-        out.push('\t');
-        out.push_str(&row.window_title);
     }
 
     out
-}
-
-fn apply_best_available_tab_titles(
-    rows: &mut [CapturedTabSurface],
-    visible_titles: Option<&BTreeMap<usize, String>>,
-) {
-    if rows.is_empty() {
-        return;
-    }
-
-    if let Some(visible_titles) = visible_titles {
-        for row in rows.iter_mut() {
-            if let Some(title) = visible_titles.get(&row.tab_index) {
-                row.title = title.clone();
-            }
-        }
-        return;
-    }
-
-    if let Some(selected_row) = rows
-        .iter()
-        .find(|row| row.selected && !row.window_title.is_empty() && row.window_title != row.title)
-    {
-        let selected_tab_index = selected_row.tab_index;
-        let window_title = selected_row.window_title.clone();
-        for row in rows
-            .iter_mut()
-            .filter(|row| row.tab_index == selected_tab_index)
-        {
-            row.title = window_title.clone();
-        }
-    }
 }
 
 fn normalize_captured_tab_title(raw: &str) -> String {
@@ -1172,138 +1108,34 @@ fn strip_spinner_prefix(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn capture_frontmost_ghostty_tab_titles_via_ax(
-    expected_tab_count: usize,
-) -> Option<BTreeMap<usize, String>> {
-    if expected_tab_count == 0 {
-        return Some(BTreeMap::new());
+fn looks_like_shell_default_title(raw: &str, _working_dir: &str) -> bool {
+    let title = normalize_captured_tab_title(raw);
+    if title.is_empty() {
+        return true;
     }
 
-    let raw = run_osascript(
-        r#"set D to (ASCII character 9)
-tell application "System Events"
-  tell process "Ghostty"
-    set targetWindow to missing value
-    repeat with candidate in windows
-      try
-        if value of attribute "AXMain" of candidate is true then
-          set targetWindow to candidate
-          exit repeat
-        end if
-      end try
-    end repeat
-    if targetWindow is missing value then
-      if (count of windows) is 0 then error "Ghostty has no visible window"
-      set targetWindow to window 1
-    end if
-    set {windowX, windowY} to position of targetWindow
-    set rows to {}
-    repeat with elem in entire contents of targetWindow
-      try
-        set elemRole to role of elem
-        if elemRole is "AXRadioButton" or elemRole is "AXButton" or elemRole is "AXStaticText" then
-          set elemName to name of elem
-          if elemName is not missing value and elemName is not "" then
-            set {xPos, yPos} to position of elem
-            set {elemWidth, elemHeight} to size of elem
-            set end of rows to elemRole & D & elemName & D & ((xPos - windowX) as text) & D & ((yPos - windowY) as text) & D & (elemWidth as text) & D & (elemHeight as text)
-          end if
-        end if
-      end try
-    end repeat
-  end tell
-end tell
-set AppleScript's text item delimiters to linefeed
-return rows as text"#,
-    )
-    .ok()?;
-
-    let elements = parse_accessibility_elements(&raw);
-    infer_tab_titles_from_accessibility_elements(&elements, expected_tab_count)
-}
-
-fn parse_accessibility_elements(raw: &str) -> Vec<AccessibilityElement> {
-    raw.lines()
-        .filter_map(parse_accessibility_element)
-        .collect()
-}
-
-fn parse_accessibility_element(line: &str) -> Option<AccessibilityElement> {
-    let mut parts = line.split('\t');
-    let role = parts.next()?.to_string();
-    let name = normalize_captured_tab_title(parts.next()?);
-    let x = parts.next()?.trim().parse().ok()?;
-    let y = parts.next()?.trim().parse().ok()?;
-    let width = parts.next()?.trim().parse().ok()?;
-    let height = parts.next()?.trim().parse().ok()?;
-
-    Some(AccessibilityElement {
-        role,
-        name,
-        x,
-        y,
-        width,
-        height,
-    })
-}
-
-fn infer_tab_titles_from_accessibility_elements(
-    elements: &[AccessibilityElement],
-    expected_tab_count: usize,
-) -> Option<BTreeMap<usize, String>> {
-    const ROLE_PRIORITY: [&str; 3] = ["AXRadioButton", "AXButton", "AXStaticText"];
-    const MAX_TABBAR_RELATIVE_Y: i32 = 120;
-    const MIN_TAB_WIDTH: i32 = 24;
-    const MIN_TAB_HEIGHT: i32 = 10;
-    const MIN_TAB_RELATIVE_X: i32 = 40;
-
-    let mut best_match: Option<(usize, i32, Vec<String>)> = None;
-
-    for (priority, role) in ROLE_PRIORITY.iter().enumerate() {
-        let mut groups: BTreeMap<i32, Vec<&AccessibilityElement>> = BTreeMap::new();
-
-        for element in elements.iter().filter(|element| {
-            element.role == *role
-                && !element.name.is_empty()
-                && element.x >= MIN_TAB_RELATIVE_X
-                && element.y >= 0
-                && element.y <= MAX_TABBAR_RELATIVE_Y
-                && element.width >= MIN_TAB_WIDTH
-                && element.height >= MIN_TAB_HEIGHT
-        }) {
-            groups.entry(element.y / 12).or_default().push(element);
-        }
-
-        for group in groups.values_mut() {
-            group.sort_by_key(|element| (element.x, element.y));
-            let names: Vec<String> = group
-                .iter()
-                .map(|element| normalize_captured_tab_title(&element.name))
-                .filter(|name| !name.is_empty())
-                .collect();
-            if names.len() != expected_tab_count {
-                continue;
-            }
-
-            let total_width = group.iter().map(|element| element.width).sum();
-            let candidate = (priority, total_width, names);
-            let is_better = best_match
-                .as_ref()
-                .map(|best| candidate.0 < best.0 || (candidate.0 == best.0 && candidate.1 > best.1))
-                .unwrap_or(true);
-            if is_better {
-                best_match = Some(candidate);
-            }
+    // user@host:path pattern (e.g. "fran@MacBook:~/project")
+    if let Some(at_pos) = title.find('@') {
+        if title[at_pos + 1..].contains(':') {
+            return true;
         }
     }
 
-    let (_, _, names) = best_match?;
-    Some(
-        names
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| (index + 1, name))
-            .collect(),
+    // path-like patterns
+    if title.starts_with("~/") || title == "~" {
+        return true;
+    }
+    if title.starts_with("…/") {
+        return true;
+    }
+    if title.starts_with('/') {
+        return true;
+    }
+
+    // common shell process names
+    matches!(
+        title.as_str(),
+        "zsh" | "bash" | "fish" | "sh" | "-zsh" | "-bash"
     )
 }
 
@@ -1334,7 +1166,9 @@ fn build_workspace_script(rows: &[TabRow]) -> String {
             out.push_str(&format!("    set term{n} to focused terminal of tab{n}"));
         }
 
-        if !row.title.is_empty() {
+        if !row.title.is_empty()
+            && !looks_like_shell_default_title(&row.title, &row.working_dir)
+        {
             out.push_str(&format!(
                 "\n    perform action \"set_tab_title:{}\" on term{n}",
                 apple_escape(&row.title)
@@ -1346,34 +1180,6 @@ fn build_workspace_script(rows: &[TabRow]) -> String {
     out
 }
 
-fn launch_workspace_rows_in_background(rows: &[TabRow], frame: &WindowFrame) -> Result<()> {
-    let Some(first_row) = rows.first() else {
-        bail!("workspace has no tabs to launch");
-    };
-
-    let existing_window_ids = ghostty_window_ids()?;
-
-    create_ghostty_window_via_applescript(first_row)?;
-    let window_id = wait_for_new_ghostty_window_id(&existing_window_ids)?;
-
-    reposition_ghostty_window(&window_id, frame)?;
-
-    if let Some(script) = build_workspace_followup_script(&window_id, rows) {
-        run_osascript(&script).context("failed to finish restoring the workspace tabs")?;
-    }
-
-    activate_ghostty_window(&window_id)?;
-    Ok(())
-}
-
-fn create_ghostty_window_via_applescript(first_row: &TabRow) -> Result<()> {
-    let script = format!(
-        "tell application \"Ghostty\"\n    set cfg to new surface configuration\n    set initial working directory of cfg to \"{wd}\"\n    set win to new window with configuration cfg\nend tell",
-        wd = apple_escape(&first_row.working_dir)
-    );
-    run_osascript(&script).context("failed to create a new Ghostty window")?;
-    Ok(())
-}
 
 fn reposition_ghostty_window(window_id: &str, frame: &WindowFrame) -> Result<()> {
     let script = format!(
@@ -1474,65 +1280,6 @@ end tell"#,
     parse_window_frame(&output)
 }
 
-fn build_workspace_followup_script(window_id: &str, rows: &[TabRow]) -> Option<String> {
-    let first_row = rows.first()?;
-    let has_extra_tabs = rows.len() > 1;
-    let has_first_title = !first_row.title.is_empty();
-    if !has_extra_tabs && !has_first_title {
-        return None;
-    }
-
-    let mut out = format!(
-        "tell application \"Ghostty\"\n    set matchingWindows to every window whose id is \"{}\"\n    if (count of matchingWindows) is 0 then error \"Ghostty window not found after launch\"\n    set win to item 1 of matchingWindows",
-        apple_escape(window_id)
-    );
-
-    if has_first_title {
-        out.push_str("\n    set term1 to focused terminal of selected tab of win");
-        out.push_str(&format!(
-            "\n    perform action \"set_tab_title:{}\" on term1",
-            apple_escape(&first_row.title)
-        ));
-    }
-
-    for (index, row) in rows.iter().enumerate().skip(1) {
-        let n = index + 1;
-        out.push_str("\n\n");
-        out.push_str(&format!("    set cfg{n} to new surface configuration\n"));
-        out.push_str(&format!(
-            "    set initial working directory of cfg{n} to \"{}\"\n",
-            apple_escape(&row.working_dir)
-        ));
-        out.push_str(&format!(
-            "    set tab{n} to new tab in win with configuration cfg{n}\n"
-        ));
-        out.push_str(&format!("    set term{n} to focused terminal of tab{n}"));
-        if !row.title.is_empty() {
-            out.push_str(&format!(
-                "\n    perform action \"set_tab_title:{}\" on term{n}",
-                apple_escape(&row.title)
-            ));
-        }
-    }
-
-    out.push_str("\nend tell\n");
-    Some(out)
-}
-
-fn activate_ghostty_window(window_id: &str) -> Result<()> {
-    let script = format!(
-        r#"tell application "Ghostty"
-  set matchingWindows to every window whose id is "{}"
-  if (count of matchingWindows) is 0 then error "Ghostty window not found after launch"
-  activate window (item 1 of matchingWindows)
-end tell"#,
-        apple_escape(window_id)
-    );
-
-    run_osascript(&script).context("failed to activate the launched Ghostty window")?;
-    Ok(())
-}
-
 fn parse_window_frame(raw: &str) -> Result<WindowFrame> {
     let parts: Vec<&str> = raw.trim().split('\t').map(str::trim).collect();
     if parts.len() != 4 {
@@ -1586,12 +1333,10 @@ fn parse_workspace_rows(script: &str) -> Vec<TabRow> {
 fn plan_workspace_launch(script: &str, rows: &[TabRow]) -> WorkspaceLaunchMode {
     if workspace_requires_true_legacy_launch(script) {
         WorkspaceLaunchMode::DirectLegacy
-    } else if workspace_has_splits(script) {
-        WorkspaceLaunchMode::DirectSplit
     } else if rows.is_empty() {
         WorkspaceLaunchMode::DirectFallback
     } else {
-        WorkspaceLaunchMode::Reconstructed
+        WorkspaceLaunchMode::DirectSplit
     }
 }
 
@@ -1640,12 +1385,6 @@ fn workspace_requires_true_legacy_launch(script: &str) -> bool {
             || line.starts_with("set initial input of cfg")
             || line.starts_with("set wait after command of cfg")
             || line.starts_with("set environment variables of cfg")
-    })
-}
-
-fn workspace_has_splits(script: &str) -> bool {
-    script.lines().map(str::trim).any(|line| {
-        line.starts_with("set p") && line.contains(" split ") && line.contains(" direction ")
     })
 }
 
@@ -2057,17 +1796,16 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccessibilityElement, AppEnv, CapturedPaneRect, CapturedTabSurface, Config,
-        GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame, WorkspaceLaunchMode,
-        apple_escape, apply_best_available_tab_titles, build_ghostty_shortcut_include,
-        build_workspace_followup_script, build_workspace_script, format_workspace_list,
-        infer_tab_titles_from_accessibility_elements, normalize_captured_tab_title,
+        AppEnv, Config, GhosttyConfigSync,
+        GhosttyShortcutApplyStatus, TabRow, WindowFrame, WorkspaceLaunchMode, apple_escape,
+        build_ghostty_shortcut_include, build_workspace_script,
+        format_workspace_list, looks_like_shell_default_title, normalize_captured_tab_title,
         parse_window_frame, parse_workspace_rows, parse_workspace_tabs, plan_workspace_launch,
         render_ghostty_include_config_line, should_switch_to_ascii_input_source,
-        sync_ghostty_include_reference, validate_workspace_name, workspace_has_splits,
+        sync_ghostty_include_reference, validate_workspace_name,
         workspace_requires_true_legacy_launch,
     };
-    use std::{collections::BTreeMap, fs, path::PathBuf};
+    use std::{fs, path::PathBuf};
 
     #[cfg(unix)]
     use std::os::unix::{fs::symlink, prelude::PermissionsExt};
@@ -2273,29 +2011,6 @@ end tell
     }
 
     #[test]
-    fn workspace_followup_script_targets_specific_window_and_skips_empty_titles() {
-        let script = build_workspace_followup_script(
-            "ghostty-window-123",
-            &[
-                TabRow {
-                    working_dir: "/tmp/demo".to_string(),
-                    title: String::new(),
-                },
-                TabRow {
-                    working_dir: "/tmp/api".to_string(),
-                    title: "api".to_string(),
-                },
-            ],
-        )
-        .unwrap();
-
-        assert!(script.contains("every window whose id is \"ghostty-window-123\""));
-        assert!(!script.contains("set_tab_title:\" on term1"));
-        assert!(script.contains("set initial working directory of cfg2 to \"/tmp/api\""));
-        assert!(script.contains("set_tab_title:api"));
-    }
-
-    #[test]
     fn captured_titles_strip_transient_prefixes() {
         assert_eq!(
             normalize_captured_tab_title("⠐ 🔔 dither-motion"),
@@ -2306,45 +2021,57 @@ end tell
     }
 
     #[test]
-    fn selected_window_title_overrides_dynamic_selected_tab_title_when_ax_is_unavailable() {
-        let mut rows = vec![
-            captured_surface(1, "dither-motion", true, "dither"),
-            captured_surface(2, "api", false, "dither"),
+    fn shell_default_title_detection_suppresses_expected_patterns() {
+        let wd = "/Users/fran/Documents/GitHub/dither-motion";
+        let cases = [
+            ("fran@frandeMacBook-Pro:~/Documents/GitHub/dither-motion", wd),
+            ("~/Documents/GitHub/gtab", "/Users/fran/Documents/GitHub/gtab"),
+            ("…/GitHub/rss-breeze/", "/Users/fran/Documents/GitHub/rss-breeze"),
+            ("zsh", "/Users/fran"),
+            ("", wd),
+            ("   ", wd),
+            ("🔔 fran@host:~/foo", "/tmp"),
         ];
-
-        apply_best_available_tab_titles(&mut rows, None);
-
-        assert_eq!(rows[0].title, "dither");
-        assert_eq!(rows[1].title, "api");
+        for (title, working_dir) in cases {
+            assert!(
+                looks_like_shell_default_title(title, working_dir),
+                "{title:?} with wd={working_dir:?} should be treated as shell default"
+            );
+        }
     }
 
     #[test]
-    fn accessibility_titles_are_preferred_when_available() {
-        let mut rows = vec![
-            captured_surface(1, "dither-motion", true, "dither"),
-            captured_surface(2, "🔔 api", false, "dither"),
+    fn shell_default_title_detection_preserves_custom_titles() {
+        let cases = [
+            ("dither-motion", "/Users/fran/Documents/GitHub/new"),
+            ("rss", "/Users/fran/Documents/GitHub/rss-breeze"),
+            ("api", "/tmp/project"),
+            ("operation", "/Users/fran/Documents/GitHub/new"),
+            ("my project", "/Users/fran/work"),
         ];
-        let visible_titles = BTreeMap::from([(1, "dither".to_string()), (2, "worker".to_string())]);
-
-        apply_best_available_tab_titles(&mut rows, Some(&visible_titles));
-
-        assert_eq!(rows[0].title, "dither");
-        assert_eq!(rows[1].title, "worker");
+        for (title, working_dir) in cases {
+            assert!(
+                !looks_like_shell_default_title(title, working_dir),
+                "{title:?} with wd={working_dir:?} should be preserved as custom title"
+            );
+        }
     }
 
     #[test]
-    fn accessibility_inference_prefers_exact_tab_groups() {
-        let elements = vec![
-            accessibility_element("AXButton", "Close", 10, 12, 14, 14),
-            accessibility_element("AXRadioButton", "⠐ dither", 68, 24, 96, 28),
-            accessibility_element("AXRadioButton", "🔔 worker", 172, 24, 104, 28),
-            accessibility_element("AXStaticText", "Output", 90, 160, 64, 20),
-        ];
+    fn build_workspace_script_suppresses_shell_default_titles() {
+        let script = build_workspace_script(&[
+            TabRow {
+                working_dir: "/tmp/project".to_string(),
+                title: "fran@host:~/tmp/project".to_string(), // shell default
+            },
+            TabRow {
+                working_dir: "/Users/fran/Documents/GitHub/new".to_string(),
+                title: "operation".to_string(), // custom (not equal to basename "new")
+            },
+        ]);
 
-        let titles = infer_tab_titles_from_accessibility_elements(&elements, 2).unwrap();
-
-        assert_eq!(titles.get(&1), Some(&"dither".to_string()));
-        assert_eq!(titles.get(&2), Some(&"worker".to_string()));
+        assert!(!script.contains("set_tab_title:fran@host"));
+        assert!(script.contains("set_tab_title:operation"));
     }
 
     #[test]
@@ -2397,7 +2124,7 @@ end tell"#;
     }
 
     #[test]
-    fn launch_plan_uses_reconstructed_mode_for_plain_workspaces() {
+    fn launch_plan_uses_direct_split_mode_for_plain_workspaces() {
         let script = r#"tell application "Ghostty"
     activate
 
@@ -2410,7 +2137,7 @@ end tell"#;
         let rows = parse_workspace_rows(script);
         assert_eq!(
             plan_workspace_launch(script, &rows),
-            WorkspaceLaunchMode::Reconstructed
+            WorkspaceLaunchMode::DirectSplit
         );
     }
 
@@ -2428,25 +2155,75 @@ end tell"#;
     }
 
     #[test]
-    fn split_workspace_detected_correctly() {
-        assert!(workspace_has_splits(
-            r#"tell application "Ghostty"
+    fn split_workspace_uses_direct_split_launch() {
+        let script = r#"tell application "Ghostty"
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set win to new window with configuration cfg1
     set p1 to split p0 direction right with configuration cfg2
-end tell"#
-        ));
-
-        assert!(!workspace_has_splits(
-            r#"tell application "Ghostty"
-    set newtab1 to new tab in win with configuration cfg2
-end tell"#
-        ));
+end tell"#;
+        let rows = parse_workspace_rows(script);
+        assert_eq!(
+            plan_workspace_launch(script, &rows),
+            WorkspaceLaunchMode::DirectSplit
+        );
 
         // split workspaces are not treated as "true legacy"
-        assert!(!workspace_requires_true_legacy_launch(
-            r#"tell application "Ghostty"
-    set p1 to split p0 direction right with configuration cfg2
-end tell"#
-        ));
+        assert!(!workspace_requires_true_legacy_launch(script));
+    }
+
+    /// Regression guard for the v1.4.1–v1.4.3 TUI launch-path bug: tab-only
+    /// workspaces with custom titles were launched via a multi-step path
+    /// (create window → poll for new window id → reposition → separate
+    /// followup script that set titles). The gap between "create window" and
+    /// "set_tab_title:" gave the shell's precmd time to overwrite the title
+    /// with the shell default (e.g. `fran@host:~/path`), so saved titles
+    /// never survived a TUI launch.
+    ///
+    /// All non-legacy workspaces must route through `DirectSplit`, which runs
+    /// the saved `.applescript` file in a single `osascript` invocation so
+    /// that `set_tab_title:` executes in the same Apple Events queue as
+    /// `new window`, matching the v1.3.x behavior that worked. Do not
+    /// reintroduce a launch mode that issues `new window` and `set_tab_title:`
+    /// from separate `osascript` processes.
+    ///
+    /// The script below mirrors the exact format produced by
+    /// `capture_workspace_script`'s embedded Python generator (tab-only
+    /// workspaces, `perform action "set_tab_title:..." on p<N>`). Note that
+    /// `parse_workspace_rows` only recognises the `on term<N>` form used by
+    /// the cfg(test) `build_workspace_script` helper, so `rows[i].title` is
+    /// empty here — but that's fine: the launch planner only needs
+    /// `rows.len()` to pick the mode, and `DirectSplit` hands the whole
+    /// file to `osascript` which executes every `set_tab_title:` verbatim.
+    #[test]
+    fn tab_only_workspace_with_custom_titles_uses_direct_split_launch() {
+        let script = r#"tell application "Ghostty"
+    activate
+
+    set cfg1 to new surface configuration
+    set initial working directory of cfg1 to "/tmp/project"
+    set win to new window with configuration cfg1
+    set p1 to focused terminal of selected tab of win
+    perform action "set_tab_title:alpha" on p1
+
+    set cfg2 to new surface configuration
+    set initial working directory of cfg2 to "/tmp/work"
+    set newtab1 to new tab in win with configuration cfg2
+    set p2 to focused terminal of newtab1
+    perform action "set_tab_title:beta" on p2
+end tell"#;
+
+        let rows = parse_workspace_rows(script);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            plan_workspace_launch(script, &rows),
+            WorkspaceLaunchMode::DirectSplit
+        );
+        assert!(!workspace_requires_true_legacy_launch(script));
+        // Sanity: the saved script still contains the title commands so that
+        // the single-osascript launch will re-apply them.
+        assert!(script.contains("set_tab_title:alpha"));
+        assert!(script.contains("set_tab_title:beta"));
     }
 
     #[test]
@@ -2745,52 +2522,11 @@ end tell"#
         std::env::temp_dir().join(format!("gtab-{name}-{nanos}"))
     }
 
-    fn captured_surface(
-        tab_index: usize,
-        title: &str,
-        selected: bool,
-        window_title: &str,
-    ) -> CapturedTabSurface {
-        CapturedTabSurface {
-            tab_index,
-            pane_index: 1,
-            terminal_id: format!("term-{tab_index}"),
-            working_dir: format!("/tmp/tab-{tab_index}"),
-            title: title.to_string(),
-            rect: CapturedPaneRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-            selected,
-            window_title: window_title.to_string(),
-        }
-    }
-
     fn workspace(name: &str) -> super::Workspace {
         super::Workspace {
             name: name.to_string(),
             path: PathBuf::from(format!("/tmp/{name}.applescript")),
             tabs: vec![],
-        }
-    }
-
-    fn accessibility_element(
-        role: &str,
-        name: &str,
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
-    ) -> AccessibilityElement {
-        AccessibilityElement {
-            role: role.to_string(),
-            name: name.to_string(),
-            x,
-            y,
-            width,
-            height,
         }
     }
 
