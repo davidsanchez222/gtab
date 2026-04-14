@@ -1590,18 +1590,14 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
         let available = width.saturating_sub(prefix.chars().count());
 
         let mut raw = if app.filter.is_empty() {
-            // No hint when idle; only show a cursor in active filter mode.
+            // Only show a hint when explicitly in filter mode.
             if app.search_active() {
-                "|".to_string()
+                "type to filter".to_string()
             } else {
                 String::new()
             }
         } else {
-            let mut text = app.filter.clone();
-            if app.search_active() {
-                text.push('|');
-            }
-            text
+            app.filter.clone()
         };
 
         if available == 0 {
@@ -1613,10 +1609,16 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
             fit_text(&raw, available)
         };
 
+        let value_style = if app.filter.is_empty() {
+            theme.muted
+        } else {
+            theme.emphasis
+        };
+
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(prefix, theme.accent),
-                Span::styled(shown, theme.emphasis),
+                Span::styled(shown, value_style),
             ])),
             prompt_area,
         );
@@ -3074,4 +3076,3 @@ mod tests {
         assert_eq!(app.rename_original.as_deref(), Some("docs"));
     }
 }
-
