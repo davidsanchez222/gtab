@@ -1122,13 +1122,6 @@ impl App {
     }
 
     fn handle_main_key(&mut self, key: KeyEvent, env: &AppEnv) -> Result<Action> {
-        if let KeyCode::Char(c) = key.code
-            && should_start_quick_search(c, key.modifiers)
-        {
-            self.begin_search(Some(c));
-            return Ok(Action::None);
-        }
-
         match key.code {
             KeyCode::Char('q') => Ok(Action::Quit),
             KeyCode::Char('?') => {
@@ -1575,7 +1568,60 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
         .border_style(theme.border);
     let inner = panel.inner(area);
     frame.render_widget(panel, area);
-    app.list_area = inner;
+
+    // Only show the filter buffer when the user is in filter mode, or when a
+    // filter is already applied.
+    let show_prompt = app.search_active() || !app.filter.is_empty();
+    let (prompt_area, list_area) = if show_prompt {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, inner)
+    };
+
+    app.list_area = list_area;
+
+    if let Some(prompt_area) = prompt_area {
+        let width = prompt_area.width.max(1) as usize;
+        let prefix = if width >= 2 { "/ " } else { "/" };
+        let available = width.saturating_sub(prefix.chars().count());
+
+        let mut raw = if app.filter.is_empty() {
+            // No hint when idle; only show a cursor in active filter mode.
+            if app.search_active() {
+                "|".to_string()
+            } else {
+                String::new()
+            }
+        } else {
+            let mut text = app.filter.clone();
+            if app.search_active() {
+                text.push('|');
+            }
+            text
+        };
+
+        if available == 0 {
+            raw.clear();
+        }
+        let shown = if available == 0 {
+            String::new()
+        } else {
+            fit_text(&raw, available)
+        };
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(prefix, theme.accent),
+                Span::styled(shown, theme.emphasis),
+            ])),
+            prompt_area,
+        );
+    }
+
     let visible = app.visible_workspaces();
     let items: Vec<ListItem<'_>> = if visible.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
@@ -1600,7 +1646,7 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
 
     let list = List::new(items).highlight_style(theme.selection);
 
-    frame.render_stateful_widget(list, inner, &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
     app.list_offset = state.offset();
 }
 
@@ -2374,16 +2420,7 @@ fn is_text_input(modifiers: KeyModifiers) -> bool {
     )
 }
 
-fn should_start_quick_search(c: char, modifiers: KeyModifiers) -> bool {
-    if !is_text_input(modifiers) || c.is_control() || c.is_whitespace() {
-        return false;
-    }
-
-    !matches!(
-        c.to_ascii_lowercase(),
-        '/' | '?' | 'a' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 'n' | 'q' | 'r' | 's' | 't' | 'w'
-    )
-}
+// (quick-search removed; filter mode starts explicitly with '/').
 
 fn shortcut_string_for_key_event(key: KeyEvent) -> Option<String> {
     let captures_modified_key = key.modifiers.intersects(
@@ -2637,17 +2674,19 @@ mod tests {
     }
 
     #[test]
-    fn quick_search_skips_reserved_action_keys() {
-        assert!(should_start_quick_search('x', KeyModifiers::NONE));
-        assert!(should_start_quick_search('1', KeyModifiers::NONE));
-        assert!(should_start_quick_search('p', KeyModifiers::NONE));
-        assert!(!should_start_quick_search('a', KeyModifiers::NONE));
-        assert!(should_start_quick_search('c', KeyModifiers::NONE));
-        assert!(!should_start_quick_search('f', KeyModifiers::NONE));
-        assert!(!should_start_quick_search('g', KeyModifiers::NONE));
-        assert!(!should_start_quick_search('n', KeyModifiers::NONE));
-        assert!(!should_start_quick_search('q', KeyModifiers::NONE));
-        assert!(!should_start_quick_search('R', KeyModifiers::SHIFT));
+    fn main_screen_typing_letter_does_not_start_filter_mode() {
+        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+
+        assert!(app.filter.is_empty());
+        assert!(!app.search_active());
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('x')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert!(app.filter.is_empty());
+        assert!(!app.search_active());
     }
 
     #[test]
@@ -3035,3 +3074,4 @@ mod tests {
         assert_eq!(app.rename_original.as_deref(), Some("docs"));
     }
 }
+
