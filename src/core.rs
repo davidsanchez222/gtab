@@ -83,10 +83,32 @@ pub struct WorkspaceTab {
 }
 
 #[derive(Clone, Debug)]
+pub enum WorkspacePaneLayout {
+    Leaf {
+        working_dir: String,
+    },
+    SplitRight {
+        left: Box<WorkspacePaneLayout>,
+        right: Box<WorkspacePaneLayout>,
+    },
+    SplitDown {
+        top: Box<WorkspacePaneLayout>,
+        bottom: Box<WorkspacePaneLayout>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceTabLayout {
+    pub title: String,
+    pub root: WorkspacePaneLayout,
+}
+
+#[derive(Clone, Debug)]
 pub struct Workspace {
     pub name: String,
     pub path: PathBuf,
     pub tabs: Vec<WorkspaceTab>,
+    pub layout: Vec<WorkspaceTabLayout>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,14 +241,21 @@ impl AppEnv {
                 continue;
             };
 
-            let tabs = fs::read_to_string(&path)
-                .map(|content| parse_workspace_tabs(&content))
+            let content = fs::read_to_string(&path).ok();
+            let tabs = content
+                .as_deref()
+                .map(parse_workspace_tabs)
+                .unwrap_or_default();
+            let layout = content
+                .as_deref()
+                .map(parse_workspace_layout)
                 .unwrap_or_default();
 
             workspaces.push(Workspace {
                 name: stem.to_string(),
                 path,
                 tabs,
+                layout,
             });
         }
 
@@ -1521,6 +1550,189 @@ fn parse_workspace_tabs(script: &str) -> Vec<WorkspaceTab> {
         .collect()
 }
 
+fn parse_workspace_layout(script: &str) -> Vec<WorkspaceTabLayout> {
+    use std::collections::HashMap;
+
+    #[derive(Clone, Debug)]
+    enum Node {
+        Leaf { wd: String },
+        SplitRight { left: usize, right: usize },
+        SplitDown { top: usize, bottom: usize },
+    }
+
+    #[derive(Clone, Debug)]
+    struct TabBuilder {
+        root: usize,
+        root_var: String,
+        title: Option<String>,
+        nodes: Vec<Node>,
+        var_to_leaf: HashMap<String, usize>,
+    }
+
+    fn parse_var_index(var: &str) -> Option<usize> {
+        let digits_pos = var.find(|ch: char| ch.is_ascii_digit())?;
+        var[digits_pos..].parse::<usize>().ok()
+    }
+
+    fn parse_root_pane_var(line: &str) -> Option<String> {
+        let rest = line.strip_prefix("set ")?;
+        let (var, after) = rest.split_once(" to focused terminal of ")?;
+        // tab roots in gtab-generated scripts look like:
+        // - selected tab of win
+        // - focused terminal of newtabX / tabX
+        if !after.starts_with("selected tab of win")
+            && !after.starts_with("newtab")
+            && !after.starts_with("tab")
+        {
+            return None;
+        }
+        Some(var.trim().to_string())
+    }
+
+    fn parse_split(line: &str) -> Option<(String, String, bool, usize)> {
+        // set p<new> to split p<target> direction right|down with configuration cfg<idx>
+        let rest = line.strip_prefix("set ")?;
+        let (new_var, rest) = rest.split_once(" to split ")?;
+        let (target_var, rest) = rest.split_once(" direction ")?;
+        let (dir, rest) = rest.split_once(" with configuration cfg")?;
+        let cfg_index = rest.trim().parse::<usize>().ok()?;
+
+        let is_right = match dir.trim() {
+            "right" => true,
+            "down" => false,
+            _ => return None,
+        };
+
+        Some((
+            new_var.trim().to_string(),
+            target_var.trim().to_string(),
+            is_right,
+            cfg_index,
+        ))
+    }
+
+    fn parse_set_tab_title(line: &str) -> Option<(String, String)> {
+        let rest = line.strip_prefix("perform action \"set_tab_title:")?;
+        let quoted = format!("\"{rest}");
+        let (title, after_title) = parse_apple_string_prefix(&quoted)?;
+        let after_on = after_title.strip_prefix(" on ")?;
+        let var = after_on.trim();
+        Some((var.to_string(), title))
+    }
+
+    let mut cfg_wd: HashMap<usize, String> = HashMap::new();
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if let Some((index, working_dir)) =
+            parse_indexed_assignment(trimmed, "set initial working directory of cfg", " to ")
+        {
+            cfg_wd.insert(index, working_dir);
+        }
+    }
+
+    let mut tabs: Vec<TabBuilder> = Vec::new();
+    let mut current_tab: Option<usize> = None;
+
+    for line in script.lines() {
+        let trimmed = line.trim();
+
+        if let Some(root_var) = parse_root_pane_var(trimmed) {
+            let cfg_index = parse_var_index(&root_var).unwrap_or(0);
+            let wd = cfg_wd.get(&cfg_index).cloned().unwrap_or_default();
+            let mut nodes = Vec::new();
+            nodes.push(Node::Leaf { wd });
+            let mut var_to_leaf = HashMap::new();
+            var_to_leaf.insert(root_var.clone(), 0);
+            tabs.push(TabBuilder {
+                root: 0,
+                root_var,
+                title: None,
+                nodes,
+                var_to_leaf,
+            });
+            current_tab = Some(tabs.len() - 1);
+            continue;
+        }
+
+        if let Some(tab_index) = current_tab {
+            if let Some((var, title)) = parse_set_tab_title(trimmed) {
+                if var == tabs[tab_index].root_var {
+                    tabs[tab_index].title = Some(title);
+                }
+                continue;
+            }
+
+            if let Some((new_var, target_var, is_right, cfg_index)) = parse_split(trimmed) {
+                let Some(&target_leaf) = tabs[tab_index].var_to_leaf.get(&target_var) else {
+                    continue;
+                };
+
+                let target_wd = match &tabs[tab_index].nodes[target_leaf] {
+                    Node::Leaf { wd } => wd.clone(),
+                    _ => continue,
+                };
+                let new_wd = cfg_wd.get(&cfg_index).cloned().unwrap_or_default();
+                let left_or_top = tabs[tab_index].nodes.len();
+                tabs[tab_index].nodes.push(Node::Leaf { wd: target_wd });
+                let right_or_bottom = tabs[tab_index].nodes.len();
+                tabs[tab_index].nodes.push(Node::Leaf { wd: new_wd });
+
+                tabs[tab_index].nodes[target_leaf] = if is_right {
+                    Node::SplitRight {
+                        left: left_or_top,
+                        right: right_or_bottom,
+                    }
+                } else {
+                    Node::SplitDown {
+                        top: left_or_top,
+                        bottom: right_or_bottom,
+                    }
+                };
+
+                // After a split, the original variable still refers to the original pane.
+                tabs[tab_index].var_to_leaf.insert(target_var, left_or_top);
+                tabs[tab_index].var_to_leaf.insert(new_var, right_or_bottom);
+            }
+        }
+    }
+
+    fn build_layout(nodes: &[Node], index: usize) -> WorkspacePaneLayout {
+        match &nodes[index] {
+            Node::Leaf { wd } => WorkspacePaneLayout::Leaf {
+                working_dir: wd.clone(),
+            },
+            Node::SplitRight { left, right } => WorkspacePaneLayout::SplitRight {
+                left: Box::new(build_layout(nodes, *left)),
+                right: Box::new(build_layout(nodes, *right)),
+            },
+            Node::SplitDown { top, bottom } => WorkspacePaneLayout::SplitDown {
+                top: Box::new(build_layout(nodes, *top)),
+                bottom: Box::new(build_layout(nodes, *bottom)),
+            },
+        }
+    }
+
+    tabs.into_iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            let root_wd =
+                tab.var_to_leaf
+                    .get(&tab.root_var)
+                    .and_then(|leaf| match &tab.nodes[*leaf] {
+                        Node::Leaf { wd } => Some(wd.as_str()),
+                        _ => None,
+                    });
+            WorkspaceTabLayout {
+                title: tab
+                    .title
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| fallback_tab_name(index + 1, root_wd)),
+                root: build_layout(&tab.nodes, tab.root),
+            }
+        })
+        .collect()
+}
+
 fn parsed_workspace_tabs(script: &str) -> Vec<ParsedWorkspaceTab> {
     let mut tabs: Vec<ParsedWorkspaceTab> = Vec::new();
 
@@ -1564,8 +1776,11 @@ fn parse_title_assignment(line: &str) -> Option<(usize, String)> {
     let rest = line.strip_prefix("perform action \"set_tab_title:")?;
     let quoted = format!("\"{rest}");
     let (title, after_title) = parse_apple_string_prefix(&quoted)?;
-    let after_marker = after_title.strip_prefix(" on term")?;
-    let (index, _) = split_digits(after_marker)?;
+    let after_on = after_title.strip_prefix(" on ")?;
+    let after_var = after_on
+        .strip_prefix("term")
+        .or_else(|| after_on.strip_prefix('p'))?;
+    let (index, _) = split_digits(after_var)?;
     Some((index, title))
 }
 
@@ -2856,6 +3071,7 @@ end tell"#;
             name: name.to_string(),
             path: PathBuf::from(format!("/tmp/{name}.applescript")),
             tabs: vec![],
+            layout: vec![],
         }
     }
 

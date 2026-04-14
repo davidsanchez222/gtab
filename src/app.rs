@@ -1,4 +1,7 @@
-use crate::core::{AppEnv, SavedDirectory, ShortcutLauncherInputSourceGuard, Workspace};
+use crate::core::{
+    AppEnv, SavedDirectory, ShortcutLauncherInputSourceGuard, Workspace, WorkspacePaneLayout,
+    WorkspaceTabLayout,
+};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
@@ -1802,7 +1805,12 @@ fn draw_workspace_tabs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &The
 
     frame.render_widget(panel, area);
     frame.render_widget(
-        Paragraph::new(workspace_tabs_text(app, theme)).wrap(Wrap { trim: false }),
+        Paragraph::new(workspace_tabs_preview_text(
+            app,
+            inner.width,
+            inner.height,
+            theme,
+        )),
         inner,
     );
 }
@@ -1845,6 +1853,177 @@ fn workspace_tabs_text(app: &App, theme: &Theme) -> Text<'static> {
     }
 
     Text::from(Line::from(spans))
+}
+
+fn workspace_tabs_preview_text(app: &App, width: u16, height: u16, theme: &Theme) -> Text<'static> {
+    let Some(workspace) = app.selected_workspace() else {
+        return Text::default();
+    };
+
+    if workspace.layout.is_empty() {
+        if workspace.tabs.is_empty() {
+            return Text::default();
+        }
+        // If we don't have layout data (legacy workspace), fall back to the
+        // compact single-line tab list.
+        return workspace_tabs_text(app, theme);
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut remaining = height as usize;
+    let map_height = 5_usize;
+    let map_width = (width as usize).max(12);
+
+    for (index, tab) in workspace.layout.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+
+        let header = Line::from(vec![
+            Span::styled(format!("{:>2}. ", index + 1), theme.dim),
+            Span::styled(tab.title.clone(), theme.emphasis),
+        ]);
+        lines.push(header);
+        remaining = remaining.saturating_sub(1);
+
+        if remaining >= map_height {
+            let rendered = render_tab_layout_ascii(tab, map_width, map_height);
+            for row in rendered {
+                if remaining == 0 {
+                    break;
+                }
+                lines.push(Line::from(Span::styled(row, theme.dim)));
+                remaining = remaining.saturating_sub(1);
+            }
+        }
+
+        if remaining == 0 {
+            break;
+        }
+        lines.push(Line::default());
+        remaining = remaining.saturating_sub(1);
+    }
+
+    Text::from(lines)
+}
+
+fn render_tab_layout_ascii(tab: &WorkspaceTabLayout, width: usize, height: usize) -> Vec<String> {
+    let width = width.max(8);
+    let height = height.max(3);
+    let mut buf = vec![vec![' '; width]; height];
+
+    // Outer border.
+    for x in 0..width {
+        buf[0][x] = if x == 0 || x + 1 == width { '+' } else { '-' };
+        buf[height - 1][x] = if x == 0 || x + 1 == width { '+' } else { '-' };
+    }
+    for y in 1..height.saturating_sub(1) {
+        buf[y][0] = '|';
+        buf[y][width - 1] = '|';
+    }
+
+    if width >= 3 && height >= 3 {
+        render_pane_layout_ascii(&tab.root, 1, 1, width - 2, height - 2, &mut buf);
+    }
+
+    buf.into_iter()
+        .map(|row| row.into_iter().collect::<String>())
+        .collect()
+}
+
+fn render_pane_layout_ascii(
+    layout: &WorkspacePaneLayout,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    buf: &mut [Vec<char>],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    match layout {
+        WorkspacePaneLayout::Leaf { working_dir } => {
+            let label = working_dir_label(working_dir);
+            if h == 0 || w == 0 {
+                return;
+            }
+            let row = y + h / 2;
+            if row >= buf.len() {
+                return;
+            }
+            let fitted = fit_text(&label, w);
+            let start = x + w.saturating_sub(fitted.chars().count()) / 2;
+            for (i, ch) in fitted.chars().enumerate() {
+                let col = start + i;
+                if col >= buf[row].len() {
+                    break;
+                }
+                buf[row][col] = ch;
+            }
+        }
+        WorkspacePaneLayout::SplitRight { left, right } => {
+            // Leave one column for the divider.
+            if w < 3 {
+                render_pane_layout_ascii(left, x, y, w, h, buf);
+                return;
+            }
+            let left_w = (w - 1) / 2;
+            let right_w = w - 1 - left_w;
+            let split_x = x + left_w;
+
+            for yy in y..(y + h) {
+                if yy >= buf.len() || split_x >= buf[yy].len() {
+                    continue;
+                }
+                buf[yy][split_x] = match buf[yy][split_x] {
+                    ' ' | '|' => '|',
+                    _ => '+',
+                };
+            }
+
+            render_pane_layout_ascii(left, x, y, left_w, h, buf);
+            render_pane_layout_ascii(right, split_x + 1, y, right_w, h, buf);
+        }
+        WorkspacePaneLayout::SplitDown { top, bottom } => {
+            // Leave one row for the divider.
+            if h < 3 {
+                render_pane_layout_ascii(top, x, y, w, h, buf);
+                return;
+            }
+            let top_h = (h - 1) / 2;
+            let bottom_h = h - 1 - top_h;
+            let split_y = y + top_h;
+
+            if split_y < buf.len() {
+                for xx in x..(x + w) {
+                    if xx >= buf[split_y].len() {
+                        continue;
+                    }
+                    buf[split_y][xx] = match buf[split_y][xx] {
+                        ' ' | '-' => '-',
+                        _ => '+',
+                    };
+                }
+            }
+
+            render_pane_layout_ascii(top, x, y, w, top_h, buf);
+            render_pane_layout_ascii(bottom, x, split_y + 1, w, bottom_h, buf);
+        }
+    }
+}
+
+fn working_dir_label(working_dir: &str) -> String {
+    let trimmed = working_dir.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 fn quick_settings_text(_app: &App, env: &AppEnv, width: u16, theme: &Theme) -> Text<'static> {
@@ -2583,6 +2762,7 @@ mod tests {
                 title: "tab".to_string(),
                 working_dir: Some("/tmp/project".to_string()),
             }],
+            layout: vec![],
         }
     }
 
@@ -3075,6 +3255,7 @@ mod tests {
                     working_dir: Some("/tmp/project/worker".to_string()),
                 },
             ],
+            layout: vec![],
         }]);
 
         let lines = text_lines(workspace_tabs_text(&app, &theme));
@@ -3100,6 +3281,7 @@ mod tests {
             name: "empty".to_string(),
             path: PathBuf::from("/tmp/empty.applescript"),
             tabs: vec![],
+            layout: vec![],
         }]);
 
         let lines = text_lines(workspace_tabs_text(&app, &theme));
