@@ -658,6 +658,20 @@ impl App {
         self.clear_pending_click();
     }
 
+    fn move_selection_wrapping(&mut self, delta: isize) {
+        let len = self.visible_indices().len();
+        if len == 0 {
+            self.selected = 0;
+            self.clear_pending_click();
+            return;
+        }
+
+        let len_i = len as isize;
+        let next = (self.selected as isize + delta).rem_euclid(len_i) as usize;
+        self.selected = next;
+        self.clear_pending_click();
+    }
+
     fn move_to_start(&mut self) {
         self.selected = 0;
         self.clear_pending_click();
@@ -1072,6 +1086,30 @@ impl App {
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Result<Action> {
+        if key.code == KeyCode::Tab {
+            self.move_selection_wrapping(1);
+            return Ok(Action::None);
+        }
+        if key.code == KeyCode::BackTab {
+            self.move_selection_wrapping(-1);
+            return Ok(Action::None);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(c) = key.code
+        {
+            match c.to_ascii_lowercase() {
+                'n' | 'j' => {
+                    self.move_selection_wrapping(1);
+                    return Ok(Action::None);
+                }
+                'p' | 'k' => {
+                    self.move_selection_wrapping(-1);
+                    return Ok(Action::None);
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.cancel_search();
@@ -2237,6 +2275,7 @@ fn draw_help_dialog(frame: &mut Frame<'_>, theme: &Theme) {
             Line::default(),
             section_line(inner.width, "Search", theme),
             Line::from("/ starts filter"),
+            Line::from("Tab / Shift-Tab  Ctrl-n/p  Ctrl-j/k move selection"),
             Line::from("Enter keep  Esc revert"),
             Line::default(),
             section_line(inner.width, "Actions", theme),
@@ -2689,6 +2728,73 @@ mod tests {
         );
         assert!(app.filter.is_empty());
         assert!(!app.search_active());
+    }
+
+    #[test]
+    fn filter_mode_navigation_wraps_with_tab_and_ctrl_n_p() {
+        let mut app = App::new(vec![workspace("alpha"), workspace("beta"), workspace("gamma")]);
+        app.begin_search(None);
+
+        app.selected = 2;
+        assert_eq!(app.handle_search_key(KeyEvent::from(KeyCode::Tab)).unwrap(), Action::None);
+        assert_eq!(app.selected, 0);
+
+        app.selected = 0;
+        assert_eq!(
+            app.handle_search_key(KeyEvent::from(KeyCode::BackTab)).unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 2);
+
+        app.selected = 2;
+        assert_eq!(
+            app.handle_search_key(KeyEvent::new(
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL
+            ))
+            .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 0);
+
+        app.selected = 0;
+        assert_eq!(
+            app.handle_search_key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL
+            ))
+            .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn filter_mode_navigation_wraps_with_ctrl_j_k() {
+        let mut app = App::new(vec![workspace("alpha"), workspace("beta"), workspace("gamma")]);
+        app.begin_search(None);
+
+        app.selected = 2;
+        assert_eq!(
+            app.handle_search_key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL
+            ))
+            .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 0);
+
+        app.selected = 0;
+        assert_eq!(
+            app.handle_search_key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::CONTROL
+            ))
+            .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 2);
     }
 
     #[test]
