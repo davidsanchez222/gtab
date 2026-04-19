@@ -44,6 +44,7 @@ fn help_renders_usage() {
             .stdout
             .contains("Save the current Ghostty window as a workspace")
     );
+    assert!(!result.stdout.contains("--shell-cd"));
 }
 
 #[test]
@@ -207,6 +208,28 @@ fn direct_launch_of_missing_workspace_reports_error() {
     let ctx = TestContext::new("launch-missing");
 
     let result = ctx.run(["missing"]);
+
+    assert!(!result.status.success());
+    assert!(result.stdout.contains("Launching \"missing\"..."));
+    assert!(result.stderr.contains("workspace 'missing' not found"));
+}
+
+#[test]
+fn shell_cd_flag_keeps_non_tui_list_output_unchanged() {
+    let ctx = TestContext::new("shell-cd-list");
+    ctx.write_workspace("alpha", &sample_workspace_script("alpha", "/tmp/alpha"));
+
+    let result = ctx.run(["--shell-cd", "list"]);
+
+    assert!(result.status.success(), "stderr: {}", result.stderr);
+    assert_eq!(result.stdout, "Workspaces:\n  - alpha\n");
+}
+
+#[test]
+fn shell_cd_flag_keeps_non_tui_error_path_unchanged() {
+    let ctx = TestContext::new("shell-cd-launch-missing");
+
+    let result = ctx.run(["--shell-cd", "missing"]);
 
     assert!(!result.status.success());
     assert!(result.stdout.contains("Launching \"missing\"..."));

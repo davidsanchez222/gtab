@@ -1,4 +1,4 @@
-use crate::core::{AppEnv, ShortcutLauncherInputSourceGuard, Workspace};
+use crate::core::{AppEnv, SavedDirectory, ShortcutLauncherInputSourceGuard, Workspace};
 use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, Show},
@@ -20,7 +20,7 @@ use ratatui::{
 use std::{
     env,
     io::{self, Stdout},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -28,9 +28,25 @@ const DOUBLE_CLICK_MS: u64 = 350;
 const MIN_WIDTH: u16 = 52;
 const MIN_HEIGHT: u16 = 15;
 const MAIN_LIST_WIDTH: u16 = 24;
+const DIRECTORY_CELL_MIN_WIDTH: u16 = 14;
+const DIRECTORY_CELL_MAX_WIDTH: u16 = 26;
+const DIRECTORY_CELL_GAP: u16 = 2;
 
-pub fn run_tui(env: &mut AppEnv) -> Result<()> {
-    let mut app = App::new(env.list_workspaces()?);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TuiExit {
+    None,
+    Cd(PathBuf),
+    ReplaceSplit(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserMode {
+    Workspace,
+    Directory,
+}
+
+pub fn run_tui(env: &mut AppEnv) -> Result<TuiExit> {
+    let mut app = App::new(env.list_workspaces()?, env.list_directories()?);
     let (_shortcut_input_source_guard, input_source_warning) =
         match ShortcutLauncherInputSourceGuard::activate_for_tui() {
             Ok(guard) => (Some(guard), None),
@@ -69,22 +85,23 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                 match app.handle_key(key, env)? {
                     Action::None => {}
                     Action::Quit => break,
-                    Action::Refresh => match env.list_workspaces() {
-                        Ok(workspaces) => {
-                            app.reload(workspaces);
-                            app.set_success("Reloaded workspace list");
+                    Action::Refresh => match (env.list_workspaces(), env.list_directories()) {
+                        (Ok(workspaces), Ok(directories)) => {
+                            app.reload_workspaces(workspaces);
+                            app.reload_directories(directories);
+                            app.set_success("Reloaded list");
                         }
-                        Err(error) => app.set_error(error.to_string()),
+                        (Err(error), _) | (_, Err(error)) => app.set_error(error.to_string()),
                     },
-                    Action::Launch(name) => {
+                    Action::LaunchWorkspace(name) => {
                         let warning = launch_workspace_from_tui(&mut terminal, env, &name)?;
                         drop(terminal);
                         if let Some(warning) = warning {
                             eprintln!("warning: {warning}");
                         }
-                        return Ok(());
+                        return Ok(TuiExit::None);
                     }
-                    Action::Save(name) => {
+                    Action::SaveWorkspace(name) => {
                         terminal.suspend()?;
                         let result = env.save_current_window(&name);
                         terminal.resume()?;
@@ -92,7 +109,7 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                         match result {
                             Ok(path) => {
                                 app.reset_dialogs();
-                                app.reload(env.list_workspaces()?);
+                                app.reload_workspaces(env.list_workspaces()?);
                                 app.select_name(&name);
                                 app.set_success(format!(
                                     "Saved workspace \"{name}\" to {}",
@@ -102,11 +119,11 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                             Err(error) => app.set_error(error.to_string()),
                         }
                     }
-                    Action::Rename(old_name, new_name) => {
+                    Action::RenameWorkspace(old_name, new_name) => {
                         match env.rename_workspace(&old_name, &new_name) {
                             Ok(_) => {
                                 app.reset_dialogs();
-                                app.reload(env.list_workspaces()?);
+                                app.reload_workspaces(env.list_workspaces()?);
                                 app.select_name(&new_name);
                                 app.set_success(format!(
                                     "Renamed workspace \"{old_name}\" to \"{new_name}\""
@@ -115,25 +132,65 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
                             Err(error) => app.set_error(error.to_string()),
                         }
                     }
-                    Action::Edit(name) => {
+                    Action::EditWorkspace(name) => {
                         terminal.suspend()?;
                         let result = env.open_in_editor(&name);
                         terminal.resume()?;
 
                         match result {
                             Ok(()) => {
-                                app.reload(env.list_workspaces()?);
+                                app.reload_workspaces(env.list_workspaces()?);
                                 app.select_name(&name);
                                 app.set_success(format!("Closed editor for \"{name}\""));
                             }
                             Err(error) => app.set_error(error.to_string()),
                         }
                     }
-                    Action::Delete(name) => match env.remove_workspace(&name) {
+                    Action::DeleteWorkspace(name) => match env.remove_workspace(&name) {
                         Ok(_) => {
                             app.reset_dialogs();
-                            app.reload(env.list_workspaces()?);
+                            app.reload_workspaces(env.list_workspaces()?);
                             app.set_success(format!("Removed workspace \"{name}\""));
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    },
+                    Action::ReplaceDirectory(path) => match env.validate_directory_target(&path) {
+                        Ok(()) => {
+                            drop(terminal);
+                            return Ok(TuiExit::ReplaceSplit(path));
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    },
+                    Action::SaveDirectory(name, path) => match env.save_directory(&name, &path) {
+                        Ok(saved_path) => {
+                            app.reset_dialogs();
+                            app.reload_directories(env.list_directories()?);
+                            app.select_name(&name);
+                            app.set_success(format!(
+                                "Saved directory \"{name}\" to {}",
+                                display_path(&saved_path)
+                            ));
+                        }
+                        Err(error) => app.set_error(error.to_string()),
+                    },
+                    Action::RenameDirectory(old_name, new_name) => {
+                        match env.rename_directory(&old_name, &new_name) {
+                            Ok(_) => {
+                                app.reset_dialogs();
+                                app.reload_directories(env.list_directories()?);
+                                app.select_name(&new_name);
+                                app.set_success(format!(
+                                    "Renamed directory \"{old_name}\" to \"{new_name}\""
+                                ));
+                            }
+                            Err(error) => app.set_error(error.to_string()),
+                        }
+                    }
+                    Action::DeleteDirectory(name) => match env.remove_directory(&name) {
+                        Ok(_) => {
+                            app.reset_dialogs();
+                            app.reload_directories(env.list_directories()?);
+                            app.set_success(format!("Removed directory \"{name}\""));
                         }
                         Err(error) => app.set_error(error.to_string()),
                     },
@@ -180,21 +237,28 @@ pub fn run_tui(env: &mut AppEnv) -> Result<()> {
             }
             Event::Mouse(mouse) => match app.handle_mouse(mouse, env)? {
                 Action::None => {}
-                Action::Launch(name) => {
+                Action::LaunchWorkspace(name) => {
                     let warning = launch_workspace_from_tui(&mut terminal, env, &name)?;
                     drop(terminal);
                     if let Some(warning) = warning {
                         eprintln!("warning: {warning}");
                     }
-                    return Ok(());
+                    return Ok(TuiExit::None);
                 }
+                Action::ReplaceDirectory(path) => match env.validate_directory_target(&path) {
+                    Ok(()) => {
+                        drop(terminal);
+                        return Ok(TuiExit::ReplaceSplit(path));
+                    }
+                    Err(error) => app.set_error(error.to_string()),
+                },
                 _ => {}
             },
             _ => continue,
         };
     }
 
-    Ok(())
+    Ok(TuiExit::None)
 }
 
 fn launch_workspace_from_tui(
@@ -307,9 +371,12 @@ impl Drop for TerminalSession {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Dialog {
     None,
-    Save,
-    Rename,
-    ConfirmDelete,
+    SaveWorkspace,
+    SaveDirectory,
+    RenameWorkspace,
+    RenameDirectory,
+    ConfirmDeleteWorkspace,
+    ConfirmDeleteDirectory,
     Settings,
     EditGhosttyShortcut,
     Help,
@@ -334,9 +401,18 @@ struct ClickState {
     at: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DirectoryGridMetrics {
+    columns: usize,
+    rows_per_page: usize,
+    cell_width: u16,
+}
+
 #[derive(Clone, Debug)]
 struct App {
     workspaces: Vec<Workspace>,
+    directories: Vec<SavedDirectory>,
+    mode: BrowserMode,
     selected: usize,
     list_offset: usize,
     list_area: Rect,
@@ -355,9 +431,11 @@ struct App {
 }
 
 impl App {
-    fn new(workspaces: Vec<Workspace>) -> Self {
+    fn new(workspaces: Vec<Workspace>, directories: Vec<SavedDirectory>) -> Self {
         Self {
             workspaces,
+            directories,
+            mode: BrowserMode::Workspace,
             selected: 0,
             list_offset: 0,
             list_area: Rect::default(),
@@ -373,14 +451,20 @@ impl App {
             shortcut_return_dialog: Dialog::None,
             status: Some(StatusLine {
                 kind: StatusKind::Info,
-                text: "Enter launch  / filter  ? help".to_string(),
+                text: "Enter launch  f directories  / filter  ? help".to_string(),
             }),
             status_expiry: None,
         }
     }
 
-    fn reload(&mut self, workspaces: Vec<Workspace>) {
+    fn reload_workspaces(&mut self, workspaces: Vec<Workspace>) {
         self.workspaces = workspaces;
+        self.clear_pending_click();
+        self.clamp_selection();
+    }
+
+    fn reload_directories(&mut self, directories: Vec<SavedDirectory>) {
+        self.directories = directories;
         self.clear_pending_click();
         self.clamp_selection();
     }
@@ -404,51 +488,124 @@ impl App {
         self.shortcut_input = env.ghostty_shortcut_display().to_string();
     }
 
-    fn open_rename(&mut self, name: String) {
-        self.dialog = Dialog::Rename;
+    fn open_rename_workspace(&mut self, name: String) {
+        self.dialog = Dialog::RenameWorkspace;
         self.rename_input = name.clone();
         self.rename_original = Some(name);
     }
 
+    fn open_rename_directory(&mut self, name: String) {
+        self.dialog = Dialog::RenameDirectory;
+        self.rename_input = name.clone();
+        self.rename_original = Some(name);
+    }
+
+    fn switch_mode(&mut self, mode: BrowserMode) {
+        self.mode = mode;
+        self.filter.clear();
+        self.search_before_edit = None;
+        self.list_offset = 0;
+        self.reset_visible_selection();
+        match mode {
+            BrowserMode::Workspace => self.set_info("Switched to workspace space"),
+            BrowserMode::Directory => self.set_info("Switched to directory space"),
+        }
+    }
+
     fn visible_indices(&self) -> Vec<usize> {
         if self.filter.is_empty() {
-            return (0..self.workspaces.len()).collect();
+            return match self.mode {
+                BrowserMode::Workspace => (0..self.workspaces.len()).collect(),
+                BrowserMode::Directory => (0..self.directories.len()).collect(),
+            };
         }
 
         let needle = self.filter.to_lowercase();
-        self.workspaces
-            .iter()
-            .enumerate()
-            .filter_map(|(index, workspace)| {
-                workspace
-                    .name
-                    .to_lowercase()
-                    .contains(&needle)
-                    .then_some(index)
-            })
-            .collect()
+        match self.mode {
+            BrowserMode::Workspace => self
+                .workspaces
+                .iter()
+                .enumerate()
+                .filter_map(|(index, workspace)| {
+                    workspace
+                        .name
+                        .to_lowercase()
+                        .contains(&needle)
+                        .then_some(index)
+                })
+                .collect(),
+            BrowserMode::Directory => self
+                .directories
+                .iter()
+                .enumerate()
+                .filter_map(|(index, directory)| {
+                    directory
+                        .name
+                        .to_lowercase()
+                        .contains(&needle)
+                        .then_some(index)
+                })
+                .collect(),
+        }
     }
 
     fn visible_workspaces(&self) -> Vec<&Workspace> {
+        if self.mode != BrowserMode::Workspace {
+            return Vec::new();
+        }
+
         self.visible_indices()
             .iter()
             .map(|index| &self.workspaces[*index])
             .collect()
     }
 
+    fn visible_directories(&self) -> Vec<&SavedDirectory> {
+        if self.mode != BrowserMode::Directory {
+            return Vec::new();
+        }
+
+        self.visible_indices()
+            .iter()
+            .map(|index| &self.directories[*index])
+            .collect()
+    }
+
     fn selected_workspace(&self) -> Option<&Workspace> {
+        if self.mode != BrowserMode::Workspace {
+            return None;
+        }
+
         let indices = self.visible_indices();
         indices
             .get(self.selected)
             .and_then(|index| self.workspaces.get(*index))
     }
 
+    fn selected_directory(&self) -> Option<&SavedDirectory> {
+        if self.mode != BrowserMode::Directory {
+            return None;
+        }
+
+        let indices = self.visible_indices();
+        indices
+            .get(self.selected)
+            .and_then(|index| self.directories.get(*index))
+    }
+
     fn select_name(&mut self, name: &str) {
-        let Some(position) = self
-            .visible_workspaces()
-            .iter()
-            .position(|workspace| workspace.name == name)
-        else {
+        let position = match self.mode {
+            BrowserMode::Workspace => self
+                .visible_workspaces()
+                .iter()
+                .position(|workspace| workspace.name == name),
+            BrowserMode::Directory => self
+                .visible_directories()
+                .iter()
+                .position(|directory| directory.name == name),
+        };
+
+        let Some(position) = position else {
             self.selected = 0;
             self.clear_pending_click();
             return;
@@ -456,6 +613,20 @@ impl App {
 
         self.selected = position;
         self.clear_pending_click();
+    }
+
+    fn no_selection_message(&self) -> &'static str {
+        match self.mode {
+            BrowserMode::Workspace => "No workspace selected",
+            BrowserMode::Directory => "No directory selected",
+        }
+    }
+
+    fn item_label_plural(&self) -> &'static str {
+        match self.mode {
+            BrowserMode::Workspace => "workspaces",
+            BrowserMode::Directory => "directories",
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -501,7 +672,85 @@ impl App {
     }
 
     fn page_step(&self) -> isize {
-        self.list_area.height.saturating_sub(1).max(5) as isize
+        match self.mode {
+            BrowserMode::Workspace => self.list_area.height.saturating_sub(1).max(5) as isize,
+            BrowserMode::Directory => {
+                let metrics = self.directory_grid_metrics();
+                (metrics.columns.saturating_mul(metrics.rows_per_page.max(1))) as isize
+            }
+        }
+    }
+
+    fn move_vertical_selection(&mut self, direction: isize) {
+        match self.mode {
+            BrowserMode::Workspace => self.move_selection(direction),
+            BrowserMode::Directory => {
+                let metrics = self.directory_grid_metrics();
+                self.move_selection(direction.saturating_mul(metrics.columns.max(1) as isize));
+            }
+        }
+    }
+
+    fn ensure_directory_selection_visible(&mut self) {
+        if self.mode != BrowserMode::Directory {
+            return;
+        }
+
+        let len = self.visible_indices().len();
+        if len == 0 {
+            self.list_offset = 0;
+            return;
+        }
+
+        let metrics = self.directory_grid_metrics();
+        let selected_row = self.selected / metrics.columns.max(1);
+        let max_offset =
+            total_directory_rows(len, metrics.columns).saturating_sub(metrics.rows_per_page);
+
+        if selected_row < self.list_offset {
+            self.list_offset = selected_row;
+        } else if selected_row
+            >= self
+                .list_offset
+                .saturating_add(metrics.rows_per_page.max(1))
+        {
+            self.list_offset = selected_row.saturating_sub(metrics.rows_per_page.max(1) - 1);
+        }
+
+        self.list_offset = self.list_offset.min(max_offset);
+    }
+
+    fn clamp_directory_offset(&mut self) {
+        if self.mode != BrowserMode::Directory {
+            return;
+        }
+
+        let len = self.visible_indices().len();
+        let metrics = self.directory_grid_metrics();
+        let max_offset =
+            total_directory_rows(len, metrics.columns).saturating_sub(metrics.rows_per_page);
+        self.list_offset = self.list_offset.min(max_offset);
+    }
+
+    fn directory_grid_metrics(&self) -> DirectoryGridMetrics {
+        let available_width = self.list_area.width.max(1);
+        let longest_label = self
+            .visible_directories()
+            .iter()
+            .map(|directory| directory_label(&directory.name).chars().count() as u16)
+            .max()
+            .unwrap_or(DIRECTORY_CELL_MIN_WIDTH);
+        let cell_width = longest_label
+            .clamp(DIRECTORY_CELL_MIN_WIDTH, DIRECTORY_CELL_MAX_WIDTH)
+            .min(available_width);
+        let span = cell_width.saturating_add(DIRECTORY_CELL_GAP).max(1);
+        let columns = ((available_width.saturating_add(DIRECTORY_CELL_GAP)) / span).max(1) as usize;
+
+        DirectoryGridMetrics {
+            columns,
+            rows_per_page: self.list_area.height.max(1) as usize,
+            cell_width,
+        }
     }
 
     fn clear_pending_click(&mut self) {
@@ -578,9 +827,12 @@ impl App {
         }
 
         match self.dialog {
-            Dialog::Save => self.handle_save_key(key),
-            Dialog::Rename => self.handle_rename_key(key),
-            Dialog::ConfirmDelete => self.handle_delete_key(key),
+            Dialog::SaveWorkspace => self.handle_save_workspace_key(key),
+            Dialog::SaveDirectory => self.handle_save_directory_key(key),
+            Dialog::RenameWorkspace => self.handle_rename_workspace_key(key),
+            Dialog::RenameDirectory => self.handle_rename_directory_key(key),
+            Dialog::ConfirmDeleteWorkspace => self.handle_delete_workspace_key(key),
+            Dialog::ConfirmDeleteDirectory => self.handle_delete_directory_key(key),
             Dialog::Settings => self.handle_settings_key(key, env),
             Dialog::EditGhosttyShortcut => self.handle_shortcut_key(key),
             Dialog::Help => self.handle_help_key(key),
@@ -589,7 +841,7 @@ impl App {
         }
     }
 
-    fn handle_save_key(&mut self, key: KeyEvent) -> Result<Action> {
+    fn handle_save_workspace_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc => {
                 self.reset_dialogs();
@@ -602,7 +854,7 @@ impl App {
                     return Ok(Action::None);
                 }
 
-                Ok(Action::Save(name))
+                Ok(Action::SaveWorkspace(name))
             }
             KeyCode::Backspace => {
                 self.save_input.pop();
@@ -616,7 +868,36 @@ impl App {
         }
     }
 
-    fn handle_rename_key(&mut self, key: KeyEvent) -> Result<Action> {
+    fn handle_save_directory_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.reset_dialogs();
+                Ok(Action::None)
+            }
+            KeyCode::Enter => {
+                let name = self.save_input.trim().to_string();
+                if name.is_empty() {
+                    self.set_error("Directory name cannot be empty");
+                    return Ok(Action::None);
+                }
+
+                let current_dir =
+                    env::current_dir().context("failed to resolve current directory")?;
+                Ok(Action::SaveDirectory(name, current_dir))
+            }
+            KeyCode::Backspace => {
+                self.save_input.pop();
+                Ok(Action::None)
+            }
+            KeyCode::Char(c) if is_text_input(key.modifiers) => {
+                self.save_input.push(c);
+                Ok(Action::None)
+            }
+            _ => Ok(Action::None),
+        }
+    }
+
+    fn handle_rename_workspace_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc => {
                 self.reset_dialogs();
@@ -640,7 +921,7 @@ impl App {
                     return Ok(Action::None);
                 }
 
-                Ok(Action::Rename(original, name))
+                Ok(Action::RenameWorkspace(original, name))
             }
             KeyCode::Backspace => {
                 self.rename_input.pop();
@@ -654,7 +935,45 @@ impl App {
         }
     }
 
-    fn handle_delete_key(&mut self, key: KeyEvent) -> Result<Action> {
+    fn handle_rename_directory_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc => {
+                self.reset_dialogs();
+                Ok(Action::None)
+            }
+            KeyCode::Enter => {
+                let Some(original) = self.rename_original.clone() else {
+                    self.reset_dialogs();
+                    return Ok(Action::None);
+                };
+
+                let name = self.rename_input.trim().to_string();
+                if name.is_empty() {
+                    self.set_error("Directory name cannot be empty");
+                    return Ok(Action::None);
+                }
+
+                if name == original {
+                    self.reset_dialogs();
+                    self.set_info("Directory name unchanged");
+                    return Ok(Action::None);
+                }
+
+                Ok(Action::RenameDirectory(original, name))
+            }
+            KeyCode::Backspace => {
+                self.rename_input.pop();
+                Ok(Action::None)
+            }
+            KeyCode::Char(c) if is_text_input(key.modifiers) => {
+                self.rename_input.push(c);
+                Ok(Action::None)
+            }
+            _ => Ok(Action::None),
+        }
+    }
+
+    fn handle_delete_workspace_key(&mut self, key: KeyEvent) -> Result<Action> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') => {
                 self.reset_dialogs();
@@ -666,7 +985,25 @@ impl App {
                     return Ok(Action::None);
                 };
 
-                Ok(Action::Delete(workspace.name.clone()))
+                Ok(Action::DeleteWorkspace(workspace.name.clone()))
+            }
+            _ => Ok(Action::None),
+        }
+    }
+
+    fn handle_delete_directory_key(&mut self, key: KeyEvent) -> Result<Action> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.reset_dialogs();
+                Ok(Action::None)
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                let Some(directory) = self.selected_directory() else {
+                    self.reset_dialogs();
+                    return Ok(Action::None);
+                };
+
+                Ok(Action::DeleteDirectory(directory.name.clone()))
             }
             _ => Ok(Action::None),
         }
@@ -742,10 +1079,15 @@ impl App {
             }
             KeyCode::Enter => {
                 self.commit_search();
+                let total_items = match self.mode {
+                    BrowserMode::Workspace => self.workspaces.len(),
+                    BrowserMode::Directory => self.directories.len(),
+                };
                 self.set_info(format!(
-                    "Showing {} of {} workspaces",
+                    "Showing {} of {} {}",
                     self.visible_indices().len(),
-                    self.workspaces.len()
+                    total_items,
+                    self.item_label_plural()
                 ));
                 Ok(Action::None)
             }
@@ -755,11 +1097,11 @@ impl App {
                 Ok(Action::None)
             }
             KeyCode::Up => {
-                self.move_selection(-1);
+                self.move_vertical_selection(-1);
                 Ok(Action::None)
             }
             KeyCode::Down => {
-                self.move_selection(1);
+                self.move_vertical_selection(1);
                 Ok(Action::None)
             }
             KeyCode::PageUp => {
@@ -801,17 +1143,25 @@ impl App {
                 if !self.filter.is_empty() {
                     self.filter.clear();
                     self.reset_visible_selection();
-                    self.set_info("Cleared workspace filter");
+                    self.set_info(format!("Cleared {} filter", self.item_label_plural()));
                     return Ok(Action::None);
                 }
 
                 Ok(Action::Quit)
             }
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('s') => {
-                self.move_selection(1);
+                self.move_vertical_selection(1);
                 Ok(Action::None)
             }
             KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('w') => {
+                self.move_vertical_selection(-1);
+                Ok(Action::None)
+            }
+            KeyCode::Right if self.mode == BrowserMode::Directory => {
+                self.move_selection(1);
+                Ok(Action::None)
+            }
+            KeyCode::Left if self.mode == BrowserMode::Directory => {
                 self.move_selection(-1);
                 Ok(Action::None)
             }
@@ -831,53 +1181,99 @@ impl App {
                 self.move_selection(self.page_step());
                 Ok(Action::None)
             }
-            KeyCode::Enter => {
-                let Some(workspace) = self.selected_workspace() else {
-                    self.set_error("No workspace selected");
-                    return Ok(Action::None);
-                };
-                Ok(Action::Launch(workspace.name.clone()))
-            }
-            KeyCode::Char('a') => {
-                self.dialog = Dialog::Save;
-                self.save_input.clear();
-                Ok(Action::None)
-            }
-            KeyCode::Char('e') => {
-                let Some(workspace) = self.selected_workspace() else {
-                    self.set_error("No workspace selected");
-                    return Ok(Action::None);
-                };
-                Ok(Action::Edit(workspace.name.clone()))
-            }
-            KeyCode::Char('n') => {
-                let Some(name) = self
-                    .selected_workspace()
-                    .map(|workspace| workspace.name.clone())
-                else {
-                    self.set_error("No workspace selected");
-                    return Ok(Action::None);
-                };
-                self.open_rename(name);
-                Ok(Action::None)
-            }
-            KeyCode::Char('d') => {
-                if self.selected_workspace().is_some() {
-                    self.dialog = Dialog::ConfirmDelete;
+            KeyCode::Char('r') => Ok(Action::Refresh),
+            KeyCode::Char('f') => {
+                let next_mode = if self.mode == BrowserMode::Workspace {
+                    BrowserMode::Directory
                 } else {
-                    self.set_error("No workspace selected");
+                    BrowserMode::Workspace
+                };
+                self.switch_mode(next_mode);
+                Ok(Action::None)
+            }
+            KeyCode::Enter => match self.mode {
+                BrowserMode::Workspace => {
+                    let Some(workspace) = self.selected_workspace() else {
+                        self.set_error(self.no_selection_message());
+                        return Ok(Action::None);
+                    };
+                    Ok(Action::LaunchWorkspace(workspace.name.clone()))
+                }
+                BrowserMode::Directory => {
+                    let Some(directory) = self.selected_directory() else {
+                        self.set_error(self.no_selection_message());
+                        return Ok(Action::None);
+                    };
+                    Ok(Action::ReplaceDirectory(directory.path.clone()))
+                }
+            },
+            KeyCode::Char('a') => match self.mode {
+                BrowserMode::Workspace => {
+                    self.dialog = Dialog::SaveWorkspace;
+                    self.save_input.clear();
+                    Ok(Action::None)
+                }
+                BrowserMode::Directory => {
+                    self.dialog = Dialog::SaveDirectory;
+                    self.save_input.clear();
+                    Ok(Action::None)
+                }
+            },
+            KeyCode::Char('e') if self.mode == BrowserMode::Workspace => {
+                let Some(workspace) = self.selected_workspace() else {
+                    self.set_error(self.no_selection_message());
+                    return Ok(Action::None);
+                };
+                Ok(Action::EditWorkspace(workspace.name.clone()))
+            }
+            KeyCode::Char('n') => match self.mode {
+                BrowserMode::Workspace => {
+                    let Some(name) = self
+                        .selected_workspace()
+                        .map(|workspace| workspace.name.clone())
+                    else {
+                        self.set_error(self.no_selection_message());
+                        return Ok(Action::None);
+                    };
+                    self.open_rename_workspace(name);
+                    Ok(Action::None)
+                }
+                BrowserMode::Directory => {
+                    let Some(name) = self
+                        .selected_directory()
+                        .map(|directory| directory.name.clone())
+                    else {
+                        self.set_error(self.no_selection_message());
+                        return Ok(Action::None);
+                    };
+                    self.open_rename_directory(name);
+                    Ok(Action::None)
+                }
+            },
+            KeyCode::Char('d') => {
+                let has_selection = match self.mode {
+                    BrowserMode::Workspace => self.selected_workspace().is_some(),
+                    BrowserMode::Directory => self.selected_directory().is_some(),
+                };
+
+                if has_selection {
+                    self.dialog = match self.mode {
+                        BrowserMode::Workspace => Dialog::ConfirmDeleteWorkspace,
+                        BrowserMode::Directory => Dialog::ConfirmDeleteDirectory,
+                    };
+                } else {
+                    self.set_error(self.no_selection_message());
                 }
                 Ok(Action::None)
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') if self.mode == BrowserMode::Workspace => {
                 self.open_shortcut_editor(env, Dialog::None);
                 Ok(Action::None)
             }
-            KeyCode::Char('t') => {
+            KeyCode::Char('t') if self.mode == BrowserMode::Workspace => {
                 self.open_settings(env);
                 Ok(Action::None)
             }
-            KeyCode::Char('r') => Ok(Action::Refresh),
             _ => Ok(Action::None),
         }
     }
@@ -889,7 +1285,9 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if self.shortcut_contains(mouse.column, mouse.row) {
+                if self.mode == BrowserMode::Workspace
+                    && self.shortcut_contains(mouse.column, mouse.row)
+                {
                     self.clear_pending_click();
                     self.open_shortcut_editor(env, Dialog::None);
                     return Ok(Action::None);
@@ -904,30 +1302,42 @@ impl App {
                 let clicked_at = Instant::now();
                 if self.is_double_click(index, clicked_at) {
                     self.clear_pending_click();
-                    let Some(workspace) = self.selected_workspace() else {
-                        return Ok(Action::None);
-                    };
-
-                    return Ok(Action::Launch(workspace.name.clone()));
+                    return Ok(match self.mode {
+                        BrowserMode::Workspace => {
+                            let Some(workspace) = self.selected_workspace() else {
+                                return Ok(Action::None);
+                            };
+                            Action::LaunchWorkspace(workspace.name.clone())
+                        }
+                        BrowserMode::Directory => {
+                            let Some(directory) = self.selected_directory() else {
+                                return Ok(Action::None);
+                            };
+                            Action::ReplaceDirectory(directory.path.clone())
+                        }
+                    });
                 }
 
                 self.last_click = Some(ClickState {
                     index,
                     at: clicked_at,
                 });
-                let Some(workspace) = self.selected_workspace() else {
-                    return Ok(Action::None);
+                let selected_name = match self.mode {
+                    BrowserMode::Workspace => self.selected_workspace().map(|w| w.name.clone()),
+                    BrowserMode::Directory => self.selected_directory().map(|d| d.name.clone()),
                 };
 
-                self.set_info(format!("Selected \"{}\"", workspace.name));
+                if let Some(name) = selected_name {
+                    self.set_info(format!("Selected \"{name}\""));
+                }
                 Ok(Action::None)
             }
             MouseEventKind::ScrollDown if self.list_contains(mouse.column, mouse.row) => {
-                self.move_selection(1);
+                self.move_vertical_selection(1);
                 Ok(Action::None)
             }
             MouseEventKind::ScrollUp if self.list_contains(mouse.column, mouse.row) => {
-                self.move_selection(-1);
+                self.move_vertical_selection(-1);
                 Ok(Action::None)
             }
             _ => Ok(Action::None),
@@ -937,6 +1347,23 @@ impl App {
     fn list_index_at(&self, column: u16, row: u16) -> Option<usize> {
         if !self.list_contains(column, row) {
             return None;
+        }
+
+        if self.mode == BrowserMode::Directory {
+            let metrics = self.directory_grid_metrics();
+            let relative_row = row.saturating_sub(self.list_area.y) as usize;
+            let relative_x = column.saturating_sub(self.list_area.x);
+            let span = metrics.cell_width.saturating_add(DIRECTORY_CELL_GAP).max(1);
+            let column_index = (relative_x / span) as usize;
+            let inside_cell = (relative_x % span) < metrics.cell_width;
+            if !inside_cell || column_index >= metrics.columns {
+                return None;
+            }
+
+            let index = (self.list_offset + relative_row)
+                .saturating_mul(metrics.columns)
+                .saturating_add(column_index);
+            return (index < self.visible_indices().len()).then_some(index);
         }
 
         let relative_row = row.saturating_sub(self.list_area.y) as usize;
@@ -972,11 +1399,15 @@ enum Action {
     None,
     Quit,
     Refresh,
-    Launch(String),
-    Save(String),
-    Rename(String, String),
-    Edit(String),
-    Delete(String),
+    LaunchWorkspace(String),
+    SaveWorkspace(String),
+    RenameWorkspace(String, String),
+    EditWorkspace(String),
+    DeleteWorkspace(String),
+    ReplaceDirectory(PathBuf),
+    SaveDirectory(String, PathBuf),
+    RenameDirectory(String, String),
+    DeleteDirectory(String),
     ToggleCloseTab,
     SetGhosttyShortcut(String),
 }
@@ -1078,9 +1509,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut App, env: &AppEnv) {
 
     match app.dialog {
         Dialog::None => {}
-        Dialog::Save => draw_save_dialog(frame, app, &theme),
-        Dialog::Rename => draw_rename_dialog(frame, app, &theme),
-        Dialog::ConfirmDelete => draw_delete_dialog(frame, app, &theme),
+        Dialog::SaveWorkspace => draw_save_workspace_dialog(frame, app, &theme),
+        Dialog::SaveDirectory => draw_save_directory_dialog(frame, app, &theme),
+        Dialog::RenameWorkspace => draw_rename_workspace_dialog(frame, app, &theme),
+        Dialog::RenameDirectory => draw_rename_directory_dialog(frame, app, &theme),
+        Dialog::ConfirmDeleteWorkspace => draw_delete_workspace_dialog(frame, app, &theme),
+        Dialog::ConfirmDeleteDirectory => draw_delete_directory_dialog(frame, app, &theme),
         Dialog::Settings => draw_settings_dialog(frame, app, env, &theme),
         Dialog::EditGhosttyShortcut => draw_shortcut_dialog(frame, app, env, &theme),
         Dialog::Help => draw_help_dialog(frame, &theme),
@@ -1118,13 +1552,21 @@ fn draw_body(frame: &mut Frame<'_>, area: Rect, app: &mut App, env: &AppEnv, the
     let inner = content.inner(area);
     frame.render_widget(content, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(MAIN_LIST_WIDTH), Constraint::Min(24)])
-        .split(inner);
+    match app.mode {
+        BrowserMode::Workspace => {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(MAIN_LIST_WIDTH), Constraint::Min(24)])
+                .split(inner);
 
-    draw_workspace_list(frame, chunks[0], app, theme);
-    draw_workspace_detail(frame, chunks[1], app, env, theme);
+            draw_workspace_list(frame, chunks[0], app, theme);
+            draw_workspace_detail(frame, chunks[1], app, env, theme);
+        }
+        BrowserMode::Directory => {
+            app.shortcut_area = Rect::default();
+            draw_directory_list(frame, inner, app, theme);
+        }
+    }
 }
 
 fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
@@ -1160,6 +1602,89 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: 
 
     frame.render_stateful_widget(list, inner, &mut state);
     app.list_offset = state.offset();
+}
+
+fn draw_directory_list(frame: &mut Frame<'_>, area: Rect, app: &mut App, theme: &Theme) {
+    app.list_area = area;
+    app.clamp_directory_offset();
+    app.ensure_directory_selection_visible();
+    let visible = app.visible_directories();
+    let text = if visible.is_empty() {
+        Text::from(vec![Line::from(vec![Span::styled(
+            "no matches",
+            theme.muted,
+        )])])
+    } else {
+        directory_grid_text(app, &visible, theme)
+    };
+
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+}
+
+fn directory_grid_text(app: &App, visible: &[&SavedDirectory], theme: &Theme) -> Text<'static> {
+    let metrics = app.directory_grid_metrics();
+    let start_row = app.list_offset;
+    let start_index = start_row.saturating_mul(metrics.columns);
+    let end_index = visible
+        .len()
+        .min(start_index.saturating_add(metrics.columns.saturating_mul(metrics.rows_per_page)));
+    let mut lines = Vec::new();
+
+    for row_start in (start_index..end_index).step_by(metrics.columns.max(1)) {
+        let row_end = end_index.min(row_start.saturating_add(metrics.columns));
+        let mut spans = Vec::new();
+
+        for index in row_start..row_end {
+            let label =
+                fit_directory_cell(&directory_label(&visible[index].name), metrics.cell_width);
+            let style = if index == app.selected {
+                theme.selection
+            } else {
+                theme.emphasis
+            };
+            spans.push(Span::styled(label, style));
+            if index + 1 < row_end {
+                spans.push(Span::raw(" ".repeat(DIRECTORY_CELL_GAP as usize)));
+            }
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    Text::from(lines)
+}
+
+fn directory_label(name: &str) -> String {
+    format!("[{name}]")
+}
+
+fn fit_directory_cell(label: &str, cell_width: u16) -> String {
+    let width = cell_width as usize;
+    let chars: Vec<char> = label.chars().collect();
+    let truncated = if chars.len() > width {
+        if width <= 3 {
+            chars.into_iter().take(width).collect::<String>()
+        } else {
+            let mut text = chars
+                .into_iter()
+                .take(width.saturating_sub(3))
+                .collect::<String>();
+            text.push_str("...");
+            text
+        }
+    } else {
+        label.to_string()
+    };
+
+    format!("{truncated:<width$}")
+}
+
+fn total_directory_rows(len: usize, columns: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (len + columns.saturating_sub(1)) / columns.max(1)
+    }
 }
 
 fn draw_workspace_detail(
@@ -1285,21 +1810,27 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Span::styled("q", theme.accent),
             Span::raw(" close"),
         ])
-    } else if matches!(app.dialog, Dialog::Save) {
+    } else if matches!(app.dialog, Dialog::SaveWorkspace | Dialog::SaveDirectory) {
         Line::from(vec![
             Span::styled("Enter", theme.accent),
             Span::raw(" save  "),
             Span::styled("Esc", theme.accent),
             Span::raw(" cancel"),
         ])
-    } else if matches!(app.dialog, Dialog::Rename) {
+    } else if matches!(
+        app.dialog,
+        Dialog::RenameWorkspace | Dialog::RenameDirectory
+    ) {
         Line::from(vec![
             Span::styled("Enter", theme.accent),
             Span::raw(" rename  "),
             Span::styled("Esc", theme.accent),
             Span::raw(" cancel"),
         ])
-    } else if matches!(app.dialog, Dialog::ConfirmDelete) {
+    } else if matches!(
+        app.dialog,
+        Dialog::ConfirmDeleteWorkspace | Dialog::ConfirmDeleteDirectory
+    ) {
         Line::from(vec![
             Span::styled("y", theme.accent),
             Span::raw(" confirm  "),
@@ -1331,10 +1862,12 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Span::styled("Esc", theme.accent),
             Span::raw(" revert"),
         ])
-    } else {
+    } else if app.mode == BrowserMode::Workspace {
         Line::from(vec![
             Span::styled("Enter", theme.accent),
             Span::raw(" launch  "),
+            Span::styled("f", theme.accent),
+            Span::raw(" directories  "),
             Span::styled("/", theme.accent),
             Span::raw(" filter  "),
             Span::styled("a", theme.accent),
@@ -1343,10 +1876,31 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Span::raw(" rename  "),
             Span::styled("d", theme.accent),
             Span::raw(" remove  "),
+            Span::styled("e", theme.accent),
+            Span::raw(" edit  "),
             Span::styled("t", theme.accent),
             Span::raw(" settings  "),
             Span::styled("g", theme.accent),
-            Span::raw(" ghostty shortcut  "),
+            Span::raw(" shortcut  "),
+            Span::styled("?", theme.accent),
+            Span::raw(" help  "),
+            Span::styled("q", theme.accent),
+            Span::raw(" quit"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Enter", theme.accent),
+            Span::raw(" open  "),
+            Span::styled("f", theme.accent),
+            Span::raw(" workspaces  "),
+            Span::styled("/", theme.accent),
+            Span::raw(" filter  "),
+            Span::styled("a", theme.accent),
+            Span::raw(" save  "),
+            Span::styled("n", theme.accent),
+            Span::raw(" rename  "),
+            Span::styled("d", theme.accent),
+            Span::raw(" remove  "),
             Span::styled("?", theme.accent),
             Span::raw(" help  "),
             Span::styled("q", theme.accent),
@@ -1369,7 +1923,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     frame.render_widget(Paragraph::new(keys), footer_layout[1]);
 }
 
-fn draw_save_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+fn draw_save_workspace_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     let area = centered_rect(58, 34, frame.area());
     let inner = draw_dialog_shell(
         frame,
@@ -1398,7 +1952,40 @@ fn draw_save_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     );
 }
 
-fn draw_rename_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+fn draw_save_directory_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+    let area = centered_rect(58, 34, frame.area());
+    let inner = draw_dialog_shell(
+        frame,
+        area,
+        "Save Directory",
+        "Enter save | Esc cancel",
+        theme,
+    );
+    let current_dir = env::current_dir()
+        .ok()
+        .map(|path| display_path(&path))
+        .unwrap_or_else(|| "(unavailable)".to_string());
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            section_line(inner.width, "Current Directory", theme),
+            Line::from(current_dir),
+            Line::default(),
+            section_line(inner.width, "Name", theme),
+            Line::from(Span::styled(
+                if app.save_input.is_empty() {
+                    "..."
+                } else {
+                    app.save_input.as_str()
+                },
+                theme.accent,
+            )),
+        ]))
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn draw_rename_workspace_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     let workspace_name = app.rename_original.as_deref().unwrap_or("this workspace");
     let area = centered_rect(58, 36, frame.area());
     let inner = draw_dialog_shell(
@@ -1428,7 +2015,37 @@ fn draw_rename_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     );
 }
 
-fn draw_delete_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+fn draw_rename_directory_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+    let directory_name = app.rename_original.as_deref().unwrap_or("this directory");
+    let area = centered_rect(58, 36, frame.area());
+    let inner = draw_dialog_shell(
+        frame,
+        area,
+        "Rename Directory",
+        "Enter rename | Esc cancel",
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            section_line(inner.width, "Selection", theme),
+            Line::from(Span::styled(directory_name, theme.emphasis)),
+            Line::default(),
+            section_line(inner.width, "New Name", theme),
+            Line::from(Span::styled(
+                if app.rename_input.is_empty() {
+                    "..."
+                } else {
+                    app.rename_input.as_str()
+                },
+                theme.accent,
+            )),
+        ]))
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn draw_delete_workspace_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     let workspace_name = app
         .selected_workspace()
         .map(|workspace| workspace.name.as_str())
@@ -1453,6 +2070,38 @@ fn draw_delete_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
             Line::default(),
             section_line(inner.width, "Effect", theme),
             Line::from("This removes the saved AppleScript file."),
+            Line::from("The action cannot be undone from gtab."),
+        ]))
+        .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn draw_delete_directory_dialog(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
+    let directory_name = app
+        .selected_directory()
+        .map(|directory| directory.name.as_str())
+        .unwrap_or("this directory");
+
+    let area = centered_rect(56, 34, frame.area());
+    let inner = draw_dialog_shell(
+        frame,
+        area,
+        "Delete Directory",
+        "y confirm | n cancel",
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            section_line(inner.width, "Selection", theme),
+            Line::from(vec![
+                Span::styled("Delete ", theme.error),
+                Span::styled(format!("\"{directory_name}\""), theme.emphasis),
+                Span::raw("?"),
+            ]),
+            Line::default(),
+            section_line(inner.width, "Effect", theme),
+            Line::from("This removes the saved directory entry."),
             Line::from("The action cannot be undone from gtab."),
         ]))
         .wrap(Wrap { trim: true }),
@@ -1543,18 +2192,20 @@ fn draw_help_dialog(frame: &mut Frame<'_>, theme: &Theme) {
             Line::from("Enter keep  Esc revert"),
             Line::default(),
             section_line(inner.width, "Actions", theme),
-            Line::from("Enter launch  a save  n rename  e edit  d remove"),
-            Line::from("g edit Ghostty shortcut  r reload  t settings"),
+            Line::from("f toggle workspace/directory spaces"),
+            Line::from("Workspace: Enter launch  a save  n rename  e edit  d remove"),
+            Line::from("Directory: Enter replace split  a save  n rename  d remove"),
+            Line::from("Workspace-only: g edit shortcut  t settings"),
+            Line::from("r reload"),
             Line::from("q quit"),
             Line::default(),
             section_line(inner.width, "Layout", theme),
-            Line::from("Left pane lists saved workspaces."),
-            Line::from("Middle pane shows saved tabs in order."),
-            Line::from("Right pane shows the Ghostty shortcut first."),
+            Line::from("Workspace space: left list + tabs + quick settings."),
+            Line::from("Directory space: adaptive multi-column directory grid."),
             Line::default(),
             section_line(inner.width, "Mouse", theme),
-            Line::from("click select  double-click launch"),
-            Line::from("click shortcut to edit  wheel move"),
+            Line::from("click select  double-click launch/replace"),
+            Line::from("workspace: click shortcut to edit  wheel move"),
         ]))
         .wrap(Wrap { trim: true }),
         inner,
@@ -1730,7 +2381,7 @@ fn should_start_quick_search(c: char, modifiers: KeyModifiers) -> bool {
 
     !matches!(
         c.to_ascii_lowercase(),
-        '/' | '?' | 'a' | 'd' | 'e' | 'g' | 'j' | 'k' | 'n' | 'q' | 'r' | 's' | 't' | 'w'
+        '/' | '?' | 'a' | 'd' | 'e' | 'f' | 'g' | 'j' | 'k' | 'n' | 'q' | 'r' | 's' | 't' | 'w'
     )
 }
 
@@ -1857,6 +2508,17 @@ mod tests {
         }
     }
 
+    fn directory(name: &str, path: &str) -> SavedDirectory {
+        SavedDirectory {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+        }
+    }
+
+    fn app(workspaces: Vec<Workspace>) -> App {
+        App::new(workspaces, vec![])
+    }
+
     fn left_click(column: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -1891,7 +2553,7 @@ mod tests {
 
     #[test]
     fn single_click_selects_and_double_click_launches() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
         app.list_area = Rect::new(0, 0, 40, 6);
 
         assert_eq!(
@@ -1902,13 +2564,69 @@ mod tests {
 
         assert_eq!(
             app.handle_mouse(left_click(1, 1), &env()).unwrap(),
-            Action::Launch("beta".to_string())
+            Action::LaunchWorkspace("beta".to_string())
         );
     }
 
     #[test]
+    fn directory_grid_text_wraps_across_multiple_columns() {
+        let theme = Theme::detect();
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![
+            directory("docs", "/tmp/docs"),
+            directory("circle", "/tmp/circle"),
+            directory("notes", "/tmp/notes"),
+        ];
+        app.mode = BrowserMode::Directory;
+        app.list_area = Rect::new(0, 0, 40, 4);
+
+        let text = directory_grid_text(&app, &app.visible_directories(), &theme);
+        let lines = text_lines(text);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("[docs]"));
+        assert!(lines[0].contains("[circle]"));
+        assert!(lines[1].contains("[notes]"));
+    }
+
+    #[test]
+    fn directory_grid_click_maps_second_column_item() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![
+            directory("docs", "/tmp/docs"),
+            directory("circle", "/tmp/circle"),
+            directory("notes", "/tmp/notes"),
+        ];
+        app.mode = BrowserMode::Directory;
+        app.list_area = Rect::new(0, 0, 40, 4);
+
+        assert_eq!(app.list_index_at(16, 0), Some(1));
+        assert_eq!(app.list_index_at(14, 0), None);
+    }
+
+    #[test]
+    fn directory_grid_down_moves_by_visual_row() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![
+            directory("docs", "/tmp/docs"),
+            directory("circle", "/tmp/circle"),
+            directory("notes", "/tmp/notes"),
+            directory("play", "/tmp/play"),
+        ];
+        app.mode = BrowserMode::Directory;
+        app.list_area = Rect::new(0, 0, 40, 4);
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Down), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.selected, 2);
+    }
+
+    #[test]
     fn search_escape_restores_previous_filter() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
         app.filter = "al".to_string();
         app.begin_search(Some('p'));
 
@@ -1925,15 +2643,17 @@ mod tests {
         assert!(should_start_quick_search('p', KeyModifiers::NONE));
         assert!(!should_start_quick_search('a', KeyModifiers::NONE));
         assert!(should_start_quick_search('c', KeyModifiers::NONE));
+        assert!(!should_start_quick_search('f', KeyModifiers::NONE));
         assert!(!should_start_quick_search('g', KeyModifiers::NONE));
         assert!(!should_start_quick_search('n', KeyModifiers::NONE));
         assert!(!should_start_quick_search('q', KeyModifiers::NONE));
+        assert!(!should_start_quick_search('R', KeyModifiers::SHIFT));
     }
 
     #[test]
     fn quick_settings_show_shortcut_status() {
         let theme = Theme::detect();
-        let app = App::new(vec![workspace("alpha")]);
+        let app = app(vec![workspace("alpha")]);
 
         let lines = text_lines(quick_settings_text(&app, &env(), 28, &theme));
 
@@ -1950,7 +2670,7 @@ mod tests {
 
     #[test]
     fn main_screen_g_opens_shortcut_editor() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
 
         assert_eq!(
             app.handle_main_key(KeyEvent::from(KeyCode::Char('g')), &env())
@@ -1964,38 +2684,38 @@ mod tests {
 
     #[test]
     fn main_screen_n_opens_rename_dialog_with_existing_name() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
 
         assert_eq!(
             app.handle_main_key(KeyEvent::from(KeyCode::Char('n')), &env())
                 .unwrap(),
             Action::None
         );
-        assert_eq!(app.dialog, Dialog::Rename);
+        assert_eq!(app.dialog, Dialog::RenameWorkspace);
         assert_eq!(app.rename_original.as_deref(), Some("alpha"));
         assert_eq!(app.rename_input, "alpha");
     }
 
     #[test]
     fn rename_dialog_returns_rename_action() {
-        let mut app = App::new(vec![workspace("alpha")]);
-        app.open_rename("alpha".to_string());
+        let mut app = app(vec![workspace("alpha")]);
+        app.open_rename_workspace("alpha".to_string());
         app.rename_input = "beta".to_string();
 
         assert_eq!(
-            app.handle_rename_key(KeyEvent::from(KeyCode::Enter))
+            app.handle_rename_workspace_key(KeyEvent::from(KeyCode::Enter))
                 .unwrap(),
-            Action::Rename("alpha".to_string(), "beta".to_string())
+            Action::RenameWorkspace("alpha".to_string(), "beta".to_string())
         );
     }
 
     #[test]
     fn rename_dialog_closes_without_action_when_name_is_unchanged() {
-        let mut app = App::new(vec![workspace("alpha")]);
-        app.open_rename("alpha".to_string());
+        let mut app = app(vec![workspace("alpha")]);
+        app.open_rename_workspace("alpha".to_string());
 
         assert_eq!(
-            app.handle_rename_key(KeyEvent::from(KeyCode::Enter))
+            app.handle_rename_workspace_key(KeyEvent::from(KeyCode::Enter))
                 .unwrap(),
             Action::None
         );
@@ -2009,15 +2729,16 @@ mod tests {
 
     #[test]
     fn save_dialog_rejects_empty_name() {
-        let mut app = App::new(vec![workspace("alpha")]);
-        app.dialog = Dialog::Save;
+        let mut app = app(vec![workspace("alpha")]);
+        app.dialog = Dialog::SaveWorkspace;
         app.save_input = "   ".to_string();
 
         assert_eq!(
-            app.handle_save_key(KeyEvent::from(KeyCode::Enter)).unwrap(),
+            app.handle_save_workspace_key(KeyEvent::from(KeyCode::Enter))
+                .unwrap(),
             Action::None
         );
-        assert_eq!(app.dialog, Dialog::Save);
+        assert_eq!(app.dialog, Dialog::SaveWorkspace);
         assert_eq!(
             app.status.as_ref().map(|status| status.text.as_str()),
             Some("Workspace name cannot be empty")
@@ -2026,7 +2747,7 @@ mod tests {
 
     #[test]
     fn main_screen_q_returns_quit_action() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
 
         assert_eq!(
             app.handle_main_key(KeyEvent::from(KeyCode::Char('q')), &env())
@@ -2037,7 +2758,7 @@ mod tests {
 
     #[test]
     fn main_screen_enter_without_selection_sets_error() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
         app.filter = "zzz".to_string();
 
         assert_eq!(
@@ -2053,7 +2774,7 @@ mod tests {
 
     #[test]
     fn main_screen_delete_without_selection_sets_error() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
         app.filter = "zzz".to_string();
 
         assert_eq!(
@@ -2070,7 +2791,7 @@ mod tests {
 
     #[test]
     fn main_screen_edit_without_selection_sets_error() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
         app.filter = "zzz".to_string();
 
         assert_eq!(
@@ -2086,7 +2807,7 @@ mod tests {
 
     #[test]
     fn main_screen_escape_clears_filter_before_quitting() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
         app.filter = "al".to_string();
 
         assert_eq!(
@@ -2097,7 +2818,7 @@ mod tests {
         assert!(app.filter.is_empty());
         assert_eq!(
             app.status.as_ref().map(|status| status.text.as_str()),
-            Some("Cleared workspace filter")
+            Some("Cleared workspaces filter")
         );
     }
 
@@ -2121,7 +2842,7 @@ mod tests {
 
     #[test]
     fn clicking_shortcut_opens_shortcut_editor() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
         app.shortcut_area = Rect::new(30, 2, 20, 1);
 
         assert_eq!(
@@ -2135,7 +2856,7 @@ mod tests {
 
     #[test]
     fn shortcut_dialog_records_modified_keys() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
 
         assert_eq!(
             app.handle_shortcut_key(KeyEvent::new(
@@ -2150,7 +2871,7 @@ mod tests {
 
     #[test]
     fn settings_shortcut_escape_returns_to_settings_dialog() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
         app.open_shortcut_editor(&env(), Dialog::Settings);
 
         assert_eq!(
@@ -2164,7 +2885,7 @@ mod tests {
 
     #[test]
     fn settings_dialog_space_toggles_close_tab() {
-        let mut app = App::new(vec![workspace("alpha")]);
+        let mut app = app(vec![workspace("alpha")]);
         app.dialog = Dialog::Settings;
 
         assert_eq!(
@@ -2176,7 +2897,7 @@ mod tests {
 
     #[test]
     fn search_enter_commits_filter_and_sets_status() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
         app.begin_search(Some('l'));
 
         assert_eq!(
@@ -2194,7 +2915,7 @@ mod tests {
     #[test]
     fn workspace_tabs_follow_applescript_order() {
         let theme = Theme::detect();
-        let app = App::new(vec![Workspace {
+        let app = app(vec![Workspace {
             name: "alpha".to_string(),
             path: PathBuf::from("/tmp/alpha.applescript"),
             tabs: vec![
@@ -2217,7 +2938,7 @@ mod tests {
     #[test]
     fn workspace_tabs_are_empty_without_visible_selection() {
         let theme = Theme::detect();
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
         app.filter = "zzz".to_string();
 
         let lines = text_lines(workspace_tabs_text(&app, &theme));
@@ -2228,7 +2949,7 @@ mod tests {
     #[test]
     fn workspace_tabs_are_empty_when_workspace_has_no_tabs() {
         let theme = Theme::detect();
-        let app = App::new(vec![Workspace {
+        let app = app(vec![Workspace {
             name: "empty".to_string(),
             path: PathBuf::from("/tmp/empty.applescript"),
             tabs: vec![],
@@ -2237,5 +2958,80 @@ mod tests {
         let lines = text_lines(workspace_tabs_text(&app, &theme));
 
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn main_screen_f_toggles_directory_mode() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![directory("docs", "/tmp")];
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('f')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.mode, BrowserMode::Directory);
+        assert_eq!(
+            app.status.as_ref().map(|status| status.text.as_str()),
+            Some("Switched to directory space")
+        );
+    }
+
+    #[test]
+    fn directory_mode_enter_returns_replace_directory_action() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![directory("docs", "/tmp")];
+        app.mode = BrowserMode::Directory;
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Enter), &env())
+                .unwrap(),
+            Action::ReplaceDirectory(PathBuf::from("/tmp"))
+        );
+    }
+
+    #[test]
+    fn directory_mode_a_opens_save_directory_dialog() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.mode = BrowserMode::Directory;
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('a')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::SaveDirectory);
+    }
+
+    #[test]
+    fn directory_mode_double_click_replaces_directory() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![directory("docs", "/tmp/docs"), directory("tmp", "/tmp")];
+        app.mode = BrowserMode::Directory;
+        app.list_area = Rect::new(0, 0, 40, 6);
+
+        assert_eq!(
+            app.handle_mouse(left_click(16, 0), &env()).unwrap(),
+            Action::None
+        );
+        assert_eq!(
+            app.handle_mouse(left_click(16, 0), &env()).unwrap(),
+            Action::ReplaceDirectory(PathBuf::from("/tmp"))
+        );
+    }
+
+    #[test]
+    fn directory_mode_n_opens_directory_rename_dialog() {
+        let mut app = app(vec![workspace("alpha")]);
+        app.directories = vec![directory("docs", "/tmp/docs")];
+        app.mode = BrowserMode::Directory;
+
+        assert_eq!(
+            app.handle_main_key(KeyEvent::from(KeyCode::Char('n')), &env())
+                .unwrap(),
+            Action::None
+        );
+        assert_eq!(app.dialog, Dialog::RenameDirectory);
+        assert_eq!(app.rename_original.as_deref(), Some("docs"));
     }
 }

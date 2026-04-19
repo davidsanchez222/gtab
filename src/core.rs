@@ -12,6 +12,8 @@ use std::{
 };
 
 const APPLE_EXT: &str = "applescript";
+const DIR_EXT: &str = "path";
+const DIRS_DIR_NAME: &str = "dirs";
 const DEFAULT_GHOSTTY_SHORTCUT: &str = "cmd+g";
 const GHOSTTY_SHORTCUT_INCLUDE_NAME: &str = "ghostty-shortcut.conf";
 const GHOSTTY_EXTERNAL_CONFIG_REASON: &str = "Ghostty config appears to be managed externally (for example by Nix/Home Manager) and was not modified.";
@@ -85,6 +87,12 @@ pub struct Workspace {
     pub name: String,
     pub path: PathBuf,
     pub tabs: Vec<WorkspaceTab>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedDirectory {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,15 +234,76 @@ impl AppEnv {
         Ok(workspaces)
     }
 
+    pub fn list_directories(&self) -> Result<Vec<SavedDirectory>> {
+        let mut directories = Vec::new();
+        let directories_dir = self.base_dir.join(DIRS_DIR_NAME);
+        if !directories_dir.exists() {
+            return Ok(directories);
+        }
+
+        for entry in fs::read_dir(&directories_dir)
+            .with_context(|| format!("failed to read {}", directories_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some(DIR_EXT) {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+
+            let saved_path = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let saved_path = saved_path.trim_end_matches(['\r', '\n']);
+            if saved_path.is_empty() {
+                continue;
+            }
+
+            directories.push(SavedDirectory {
+                name: stem.to_string(),
+                path: PathBuf::from(saved_path),
+            });
+        }
+
+        directories.sort_by_key(|directory| directory.name.to_lowercase());
+        Ok(directories)
+    }
+
     pub fn workspace_path(&self, name: &str) -> Result<PathBuf> {
         validate_workspace_name(name)?;
         Ok(self.base_dir.join(format!("{name}.{APPLE_EXT}")))
+    }
+
+    pub fn directory_path(&self, name: &str) -> Result<PathBuf> {
+        validate_workspace_name(name)?;
+        Ok(self
+            .base_dir
+            .join(DIRS_DIR_NAME)
+            .join(format!("{name}.{DIR_EXT}")))
     }
 
     pub fn save_current_window(&self, name: &str) -> Result<PathBuf> {
         let path = self.workspace_path(name)?;
         let script = capture_workspace_script()?;
         fs::write(&path, &script).with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn save_directory(&self, name: &str, directory_path: &Path) -> Result<PathBuf> {
+        let path = self.directory_path(name)?;
+        if path.exists() {
+            bail!("directory '{name}' already exists");
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        fs::write(&path, directory_path.to_string_lossy().as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
 
@@ -290,6 +359,76 @@ impl AppEnv {
 
         fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
         Ok(path)
+    }
+
+    pub fn rename_directory(&self, old_name: &str, new_name: &str) -> Result<PathBuf> {
+        let old_path = self.directory_path(old_name)?;
+        if !old_path.exists() {
+            bail!("directory '{old_name}' not found");
+        }
+
+        if old_name == new_name {
+            return Ok(old_path);
+        }
+
+        let new_path = self.directory_path(new_name)?;
+        if new_path.exists() {
+            bail!("directory '{new_name}' already exists");
+        }
+
+        fs::rename(&old_path, &new_path).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                old_path.display(),
+                new_path.display()
+            )
+        })?;
+        Ok(new_path)
+    }
+
+    pub fn remove_directory(&self, name: &str) -> Result<PathBuf> {
+        let path = self.directory_path(name)?;
+        if !path.exists() {
+            bail!("directory '{name}' not found");
+        }
+
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+        Ok(path)
+    }
+
+    pub fn validate_directory_target(&self, path: &Path) -> Result<()> {
+        if path.as_os_str().is_empty() {
+            bail!("directory path is empty");
+        }
+
+        if !path.exists() {
+            bail!("directory '{}' not found", path.display());
+        }
+
+        if !path.is_dir() {
+            bail!("'{}' is not a directory", path.display());
+        }
+
+        Ok(())
+    }
+
+    pub fn open_directory_in_focused_terminal(&self, path: &Path) -> Result<()> {
+        self.validate_directory_target(path)?;
+        let command = render_ghostty_direct_cd_command(path);
+        let script = build_ghostty_cd_script(&command);
+        run_osascript(&script).with_context(
+            || "failed to open directory in Ghostty (check Automation permissions for osascript)",
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_directory_in_focused_terminal(&self, path: &Path) -> Result<()> {
+        self.validate_directory_target(path)?;
+        let script = build_ghostty_replace_directory_script(path);
+        run_osascript(&script).with_context(|| {
+            "failed to replace the focused Ghostty split (check Automation permissions for osascript)"
+        })?;
+        Ok(())
     }
 
     pub fn launch_workspace(&self, name: &str) -> Result<()> {
@@ -818,6 +957,35 @@ fn normalize_ghostty_shortcut(shortcut: &str) -> Result<String> {
     Ok(normalized)
 }
 
+fn render_shell_cd_command(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("cd -- '{}'", shell_single_quote_escape(&raw))
+}
+
+fn render_ghostty_direct_cd_command(path: &Path) -> String {
+    let cd_command = render_shell_cd_command(path);
+    format!(" {cd_command}")
+}
+
+fn shell_single_quote_escape(value: &str) -> String {
+    value.replace('\'', r#"'"'"'"#)
+}
+
+fn build_ghostty_cd_script(command: &str) -> String {
+    format!(
+        "tell application \"Ghostty\"\n    if (count of windows) is 0 then error \"Ghostty has no open window\"\n    set term to focused terminal of selected tab of front window\n    input text \"{}\" to term\n    send key \"enter\" to term\nend tell",
+        apple_escape(command)
+    )
+}
+
+fn build_ghostty_replace_directory_script(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    format!(
+        "tell application \"Ghostty\"\n    if (count of windows) is 0 then error \"Ghostty has no open window\"\n    set term to focused terminal of selected tab of front window\n    set cfg to new surface configuration\n    set initial working directory of cfg to \"{}\"\n    set newTerm to split term direction right with configuration cfg\n    close term\n    focus newTerm\nend tell",
+        apple_escape(&path)
+    )
+}
+
 fn is_shortcut_disabled(shortcut: &str) -> bool {
     matches!(shortcut.trim(), "off" | "none" | "disabled")
 }
@@ -1166,9 +1334,7 @@ fn build_workspace_script(rows: &[TabRow]) -> String {
             out.push_str(&format!("    set term{n} to focused terminal of tab{n}"));
         }
 
-        if !row.title.is_empty()
-            && !looks_like_shell_default_title(&row.title, &row.working_dir)
-        {
+        if !row.title.is_empty() && !looks_like_shell_default_title(&row.title, &row.working_dir) {
             out.push_str(&format!(
                 "\n    perform action \"set_tab_title:{}\" on term{n}",
                 apple_escape(&row.title)
@@ -1179,7 +1345,6 @@ fn build_workspace_script(rows: &[TabRow]) -> String {
     out.push_str("\nend tell\n");
     out
 }
-
 
 fn reposition_ghostty_window(window_id: &str, frame: &WindowFrame) -> Result<()> {
     let script = format!(
@@ -1796,14 +1961,15 @@ pub fn format_settings(env: &AppEnv) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppEnv, Config, GhosttyConfigSync,
-        GhosttyShortcutApplyStatus, TabRow, WindowFrame, WorkspaceLaunchMode, apple_escape,
-        build_ghostty_shortcut_include, build_workspace_script,
-        format_workspace_list, looks_like_shell_default_title, normalize_captured_tab_title,
-        parse_window_frame, parse_workspace_rows, parse_workspace_tabs, plan_workspace_launch,
-        render_ghostty_include_config_line, should_switch_to_ascii_input_source,
-        sync_ghostty_include_reference, validate_workspace_name,
-        workspace_requires_true_legacy_launch,
+        AppEnv, Config, GhosttyConfigSync, GhosttyShortcutApplyStatus, TabRow, WindowFrame,
+        WorkspaceLaunchMode, apple_escape, build_ghostty_cd_script,
+        build_ghostty_replace_directory_script, build_ghostty_shortcut_include,
+        build_workspace_script, format_workspace_list, looks_like_shell_default_title,
+        normalize_captured_tab_title, parse_window_frame, parse_workspace_rows,
+        parse_workspace_tabs, plan_workspace_launch, render_ghostty_direct_cd_command,
+        render_ghostty_include_config_line, render_shell_cd_command,
+        should_switch_to_ascii_input_source, sync_ghostty_include_reference,
+        validate_workspace_name, workspace_requires_true_legacy_launch,
     };
     use std::{fs, path::PathBuf};
 
@@ -2024,9 +2190,18 @@ end tell
     fn shell_default_title_detection_suppresses_expected_patterns() {
         let wd = "/Users/fran/Documents/GitHub/dither-motion";
         let cases = [
-            ("fran@frandeMacBook-Pro:~/Documents/GitHub/dither-motion", wd),
-            ("~/Documents/GitHub/gtab", "/Users/fran/Documents/GitHub/gtab"),
-            ("…/GitHub/rss-breeze/", "/Users/fran/Documents/GitHub/rss-breeze"),
+            (
+                "fran@frandeMacBook-Pro:~/Documents/GitHub/dither-motion",
+                wd,
+            ),
+            (
+                "~/Documents/GitHub/gtab",
+                "/Users/fran/Documents/GitHub/gtab",
+            ),
+            (
+                "…/GitHub/rss-breeze/",
+                "/Users/fran/Documents/GitHub/rss-breeze",
+            ),
             ("zsh", "/Users/fran"),
             ("", wd),
             ("   ", wd),
@@ -2273,6 +2448,160 @@ end tell"#;
 
         assert!(error.contains("workspace 'beta' already exists"));
         let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn list_directories_sorts_case_insensitively() {
+        let env = test_env("list-directories");
+        let dirs_path = env.base_dir.join("dirs");
+        std::fs::create_dir_all(&dirs_path).unwrap();
+        std::fs::write(dirs_path.join("Zulu.path"), "/tmp/zulu").unwrap();
+        std::fs::write(dirs_path.join("alpha.path"), "/tmp/alpha").unwrap();
+        std::fs::write(dirs_path.join("beta.path"), "/tmp/beta").unwrap();
+
+        let directories = env.list_directories().unwrap();
+
+        assert_eq!(
+            directories
+                .iter()
+                .map(|directory| directory.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta", "Zulu"]
+        );
+        assert_eq!(directories[0].path, PathBuf::from("/tmp/alpha"));
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn save_directory_writes_path_file() {
+        let env = test_env("save-directory");
+
+        let saved_path = env
+            .save_directory("docs", std::path::Path::new("/tmp/docs"))
+            .unwrap();
+
+        assert_eq!(saved_path, env.base_dir.join("dirs/docs.path"));
+        assert_eq!(std::fs::read_to_string(&saved_path).unwrap(), "/tmp/docs");
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn save_directory_rejects_existing_name() {
+        let env = test_env("save-directory-conflict");
+        std::fs::create_dir_all(env.base_dir.join("dirs")).unwrap();
+        std::fs::write(env.base_dir.join("dirs/docs.path"), "/tmp/docs").unwrap();
+
+        let error = env
+            .save_directory("docs", std::path::Path::new("/tmp/other"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("directory 'docs' already exists"));
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn rename_directory_renames_path_file() {
+        let env = test_env("rename-directory");
+        std::fs::create_dir_all(env.base_dir.join("dirs")).unwrap();
+        let old_path = env.base_dir.join("dirs/alpha.path");
+        let new_path = env.base_dir.join("dirs/beta.path");
+        std::fs::write(&old_path, "/tmp/alpha").unwrap();
+
+        let renamed = env.rename_directory("alpha", "beta").unwrap();
+
+        assert_eq!(renamed, new_path);
+        assert!(!old_path.exists());
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "/tmp/alpha");
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn rename_directory_rejects_existing_destination() {
+        let env = test_env("rename-directory-conflict");
+        std::fs::create_dir_all(env.base_dir.join("dirs")).unwrap();
+        std::fs::write(env.base_dir.join("dirs/alpha.path"), "/tmp/alpha").unwrap();
+        std::fs::write(env.base_dir.join("dirs/beta.path"), "/tmp/beta").unwrap();
+
+        let error = env
+            .rename_directory("alpha", "beta")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("directory 'beta' already exists"));
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn remove_directory_reports_not_found() {
+        let env = test_env("remove-directory-missing");
+
+        let error = env.remove_directory("missing").unwrap_err().to_string();
+
+        assert!(error.contains("directory 'missing' not found"));
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn validate_directory_target_rejects_missing_and_files() {
+        let env = test_env("validate-directory-target");
+        let missing = env.base_dir.join("missing");
+        let file_path = env.base_dir.join("file.txt");
+        std::fs::write(&file_path, "x").unwrap();
+
+        assert!(env.validate_directory_target(&missing).is_err());
+        let file_error = env
+            .validate_directory_target(&file_path)
+            .unwrap_err()
+            .to_string();
+        assert!(file_error.contains("is not a directory"));
+        assert!(env.validate_directory_target(&env.base_dir).is_ok());
+        let _ = std::fs::remove_dir_all(&env.base_dir);
+    }
+
+    #[test]
+    fn render_shell_cd_command_quotes_single_quotes() {
+        assert_eq!(
+            render_shell_cd_command(std::path::Path::new("/tmp/it'works")),
+            "cd -- '/tmp/it'\"'\"'works'"
+        );
+    }
+
+    #[test]
+    fn render_ghostty_direct_cd_command_prefixes_plain_cd() {
+        assert_eq!(
+            render_ghostty_direct_cd_command(std::path::Path::new("/tmp/it'works")),
+            " cd -- '/tmp/it'\"'\"'works'"
+        );
+    }
+
+    #[test]
+    fn build_ghostty_cd_script_includes_input_and_enter() {
+        let script = build_ghostty_cd_script("cd -- '/tmp/it'\"'\"'works'");
+        assert!(script.contains("set term to focused terminal of selected tab of front window"));
+        assert!(script.contains("input text \"cd -- '/tmp/it'\\\"'\\\"'works'\" to term"));
+        assert!(script.contains("send key \"enter\" to term"));
+    }
+
+    #[test]
+    fn build_ghostty_cd_script_keeps_no_trace_command() {
+        let command = render_ghostty_direct_cd_command(std::path::Path::new("/tmp/demo"));
+        let script = build_ghostty_cd_script(&command);
+        let expected = format!("input text \"{}\" to term", apple_escape(&command));
+        assert!(script.contains(&expected));
+    }
+
+    #[test]
+    fn build_ghostty_replace_directory_script_splits_closes_and_focuses_new_surface() {
+        let script = build_ghostty_replace_directory_script(std::path::Path::new("/tmp/it'works"));
+        assert!(script.contains("set term to focused terminal of selected tab of front window"));
+        assert!(script.contains("set cfg to new surface configuration"));
+        assert!(script.contains("set initial working directory of cfg to \"/tmp/it'works\""));
+        assert!(
+            script.contains("set newTerm to split term direction right with configuration cfg")
+        );
+        assert!(script.contains("close term"));
+        assert!(script.contains("focus newTerm"));
     }
 
     #[test]

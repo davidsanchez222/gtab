@@ -11,6 +11,9 @@ pub struct Cli {
     #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
     pub version: bool,
 
+    #[arg(long = "shell-cd", hide = true, action = ArgAction::SetTrue)]
+    pub shell_cd: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 

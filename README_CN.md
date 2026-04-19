@@ -26,6 +26,7 @@ gtab init
 
 - 把 Ghostty 窗口保存成命名 workspace——含 tabs、工作目录、标题，以及分屏布局
 - 随时把任意 workspace 重新拉起为一个新的 Ghostty 窗口，恢复原生 tabs
+- 保存命名目录项，并把当前 split 快速切换成该目录里的新 shell
 - 通过小巧的键盘优先 TUI 启动，或者直接在 shell 里运行
 - 新窗口自动对齐当前 Ghostty 窗口的位置和大小
 - 在 TUI 里直接重命名、删除、搜索 workspace，不用离开界面
@@ -62,19 +63,54 @@ gtab myproject
 
 | 按键 | 操作 |
 |------|------|
-| `/` | 搜索 workspace |
+| `f` | 在 Workspace 空间 / 目录空间之间切换 |
+| `/` | 搜索当前空间 |
 | `↑` / `↓` | 移动选中项 |
-| `Enter` | 启动当前选中的 workspace |
-| `a` | 把当前 Ghostty 窗口保存为新 workspace |
-| `n` | 重命名当前选中的 workspace |
-| `d` | 删除当前选中的 workspace |
-| `e` | 用 `$EDITOR` 打开 workspace 文件 |
-| `g` | 编辑 Ghostty 快捷键设置 |
+| `Enter` | Workspace：启动；目录空间：用该目录里的新 shell 替换当前 split |
+| `a` | Workspace：保存当前 Ghostty 窗口；目录空间：保存当前 shell 目录 |
+| `n` | 重命名当前空间的选中项 |
+| `d` | 删除当前空间的选中项 |
+| `e` | 仅 Workspace：用 `$EDITOR` 打开 workspace 文件 |
+| `g` | 仅 Workspace：编辑 Ghostty 快捷键 |
 | `q` / `Esc` | 退出 |
 
-> **双击** workspace 行同样可以启动。
+> **双击** 会执行当前空间里的主操作（启动/替换）。
 
 从 TUI 启动时，新的 Ghostty 窗口会自动对齐当前窗口的位置和大小。这依赖 macOS 辅助功能（System Events），首次使用可能需要授权。
+
+---
+
+## 目录空间
+
+目录空间只保存目录路径，不会重建 Ghostty 的 tabs 或窗口。
+
+- 在 TUI 里按 `f` 切到目录空间。
+- 保存的目录项会按窗口宽度自适应为多列网格，放不下时自动换行。
+- 按 `a` 把当前 shell 目录保存成一个命名目录项。
+- 按 `Enter`（或双击）把当前 split 替换成一个从该目录启动的新 shell。
+
+默认情况下，gtab 会把当前 split 直接替换成一个从目标目录启动的新 shell。也就是说，用户只要升级 gtab 就能直接使用目录空间，不需要额外 shell 配置。
+
+这个动作会替换当前 split 里的 shell 进程，所以这个 split 里原本的临时 shell 状态会丢失。
+
+如果你想保留 shell 包装兜底（例如在非 Ghostty 场景下），可以用：
+
+```bash
+gtab() {
+  if [ "$#" -eq 0 ]; then
+    local cmd
+    cmd="$(command gtab --shell-cd)" || return $?
+    if [ -n "$cmd" ]; then
+      eval "$cmd"
+    fi
+    return 0
+  fi
+
+  command gtab "$@"
+}
+```
+
+`gtab --shell-cd` 仅用于这个包装流程；其他命令和 workspace 启动行为不变。
 
 ---
 
@@ -99,7 +135,8 @@ gtab set close_tab on|off              启动后自动关闭发起 tab
 gtab set ghostty_shortcut cmd+g|off    修改或禁用 Ghostty 快捷键
 ```
 
-保存下来的 workspace 本质上是 `~/.config/gtab/` 下的普通 AppleScript 文件，可以直接查看或手动修改。
+保存下来的 workspace 是 `~/.config/gtab/` 下的普通 `.applescript` 文件。
+目录项保存在 `~/.config/gtab/dirs/` 下的普通 `.path` 文件。
 
 ---
 

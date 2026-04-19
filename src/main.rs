@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use gtab::{
     app,
@@ -8,6 +8,7 @@ use gtab::{
         format_workspace_list,
     },
 };
+use std::path::Path;
 
 fn main() {
     if let Err(error) = run() {
@@ -23,15 +24,22 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    let shell_cd = cli.shell_cd;
     let mut env = AppEnv::load()?;
 
     match (cli.command, cli.workspace) {
-        (None, None) => app::run_tui(&mut env),
+        (None, None) => {
+            let exit = app::run_tui(&mut env)?;
+            handle_tui_exit(&env, exit, shell_cd)
+        }
         (None, Some(name)) => {
             println!("Launching \"{name}\"...");
             env.launch_workspace(&name)
         }
-        (Some(Commands::Tui), None) => app::run_tui(&mut env),
+        (Some(Commands::Tui), None) => {
+            let exit = app::run_tui(&mut env)?;
+            handle_tui_exit(&env, exit, shell_cd)
+        }
         (Some(Commands::Init), None) => handle_init(&mut env),
         (Some(Commands::List), None) => {
             let workspaces = env.list_workspaces()?;
@@ -65,6 +73,39 @@ fn run() -> Result<()> {
         }
         _ => bail!("unexpected CLI arguments"),
     }
+}
+
+fn handle_tui_exit(env: &AppEnv, exit: app::TuiExit, shell_cd: bool) -> Result<()> {
+    match exit {
+        app::TuiExit::None => Ok(()),
+        app::TuiExit::Cd(path) if shell_cd => {
+            println!("{}", render_shell_cd_command(&path));
+            Ok(())
+        }
+        app::TuiExit::Cd(path) => env
+            .open_directory_in_focused_terminal(&path)
+            .with_context(|| {
+                "directory open failed. You can also run `gtab --shell-cd` through a shell wrapper fallback."
+            }),
+        app::TuiExit::ReplaceSplit(path) if shell_cd => {
+            println!("{}", render_shell_cd_command(&path));
+            Ok(())
+        }
+        app::TuiExit::ReplaceSplit(path) => env
+            .replace_directory_in_focused_terminal(&path)
+            .with_context(|| {
+                "directory replace failed. This action swaps the current split with a fresh shell in the target directory."
+            }),
+    }
+}
+
+fn render_shell_cd_command(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    format!("cd -- '{}'", shell_single_quote_escape(&path))
+}
+
+fn shell_single_quote_escape(value: &str) -> String {
+    value.replace('\'', r#"'"'"'"#)
 }
 
 fn handle_set(env: &mut AppEnv, key: Option<&str>, value: Option<&str>) -> Result<()> {
@@ -166,4 +207,26 @@ fn print_manual_config_removal(result: &GhosttyShortcutApplyResult) {
     println!("Remove this line from your Ghostty config source (for example Nix/Home Manager):");
     println!("  {}", result.include_config_line());
     println!("Rebuild/apply your config, then reload or restart Ghostty to disable Cmd+G.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_shell_cd_command;
+    use std::path::Path;
+
+    #[test]
+    fn render_shell_cd_command_wraps_path_for_shell_eval() {
+        assert_eq!(
+            render_shell_cd_command(Path::new("/tmp/demo")),
+            "cd -- '/tmp/demo'"
+        );
+    }
+
+    #[test]
+    fn render_shell_cd_command_escapes_single_quotes() {
+        assert_eq!(
+            render_shell_cd_command(Path::new("/tmp/it'works")),
+            "cd -- '/tmp/it'\"'\"'works'"
+        );
+    }
 }

@@ -26,6 +26,7 @@ Reload Ghostty config (or restart Ghostty), then press **Cmd+G** inside any Ghos
 
 - Save a Ghostty window as a named workspace — tabs, working directories, titles, and split panes
 - Reopen any workspace later as a fresh Ghostty window with native tabs
+- Save named directory entries and reopen the current split as a fresh shell in that directory
 - Launch from a small keyboard-first TUI, or directly from the shell
 - New window automatically aligns to your current Ghostty window position and size
 - Rename, delete, and search workspaces without leaving the TUI
@@ -62,19 +63,54 @@ gtab myproject
 
 | Key | Action |
 |-----|--------|
-| `/` | Search workspaces |
+| `f` | Toggle Workspace Space / Directory Space |
+| `/` | Search current space |
 | `↑` / `↓` | Move selection |
-| `Enter` | Launch selected workspace |
-| `a` | Save current Ghostty window as new workspace |
-| `n` | Rename selected workspace |
-| `d` | Delete selected workspace |
-| `e` | Open workspace file in `$EDITOR` |
-| `g` | Edit Ghostty shortcut |
+| `Enter` | Workspace: launch selected workspace; Directory: replace the current split with a fresh shell in that directory |
+| `a` | Workspace: save current Ghostty window; Directory: save current shell directory |
+| `n` | Rename selected item in current space |
+| `d` | Delete selected item in current space |
+| `e` | Workspace only: open workspace file in `$EDITOR` |
+| `g` | Workspace only: edit Ghostty shortcut |
 | `q` / `Esc` | Quit |
 
-> **Double-click** a workspace row also launches it.
+> **Double-click** also runs the primary action of the current space (launch/replace).
 
 When you launch from the TUI, the new Ghostty window is repositioned to match your current window's position and size. This uses macOS Accessibility (System Events), so you may need to grant permission once.
+
+---
+
+## Directory Space
+
+Directory Space stores named directory paths only. It does not rebuild Ghostty tabs or windows.
+
+- Press `f` in the TUI to switch to Directory Space.
+- Saved directories are shown in an adaptive multi-column grid that wraps as the window width changes.
+- Press `a` to save the current shell directory as a named entry.
+- Press `Enter` (or double-click) to replace the current split with a fresh shell started in that directory.
+
+By default, gtab swaps the current split process for a new shell started in the selected directory. This keeps Directory Space zero-setup: upgrade gtab and use it immediately.
+
+This replaces the shell process in that split, so in-flight shell state inside the old split is discarded.
+
+If you prefer a shell-wrapper fallback (for example, running outside Ghostty), you can still use:
+
+```bash
+gtab() {
+  if [ "$#" -eq 0 ]; then
+    local cmd
+    cmd="$(command gtab --shell-cd)" || return $?
+    if [ -n "$cmd" ]; then
+      eval "$cmd"
+    fi
+    return 0
+  fi
+
+  command gtab "$@"
+}
+```
+
+`gtab --shell-cd` is only for this wrapper flow. Other commands and workspace launches are unchanged.
 
 ---
 
@@ -99,7 +135,8 @@ gtab set close_tab on|off              Auto-close the launching tab after launch
 gtab set ghostty_shortcut cmd+g|off    Change or disable the Ghostty shortcut
 ```
 
-Workspaces are stored as plain `.applescript` files in `~/.config/gtab/` and are human-readable and manually editable.
+Workspaces are stored as plain `.applescript` files in `~/.config/gtab/`.
+Directory entries are stored as plain `.path` files in `~/.config/gtab/dirs/`.
 
 ---
 
