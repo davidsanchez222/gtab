@@ -2716,7 +2716,7 @@ mod tests {
 
     #[test]
     fn main_screen_typing_letter_does_not_start_filter_mode() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta")]);
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
 
         assert!(app.filter.is_empty());
         assert!(!app.search_active());
@@ -2732,38 +2732,40 @@ mod tests {
 
     #[test]
     fn filter_mode_navigation_wraps_with_tab_and_ctrl_n_p() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta"), workspace("gamma")]);
+        let mut app = app(vec![
+            workspace("alpha"),
+            workspace("beta"),
+            workspace("gamma"),
+        ]);
         app.begin_search(None);
 
         app.selected = 2;
-        assert_eq!(app.handle_search_key(KeyEvent::from(KeyCode::Tab)).unwrap(), Action::None);
+        assert_eq!(
+            app.handle_search_key(KeyEvent::from(KeyCode::Tab)).unwrap(),
+            Action::None
+        );
         assert_eq!(app.selected, 0);
 
         app.selected = 0;
         assert_eq!(
-            app.handle_search_key(KeyEvent::from(KeyCode::BackTab)).unwrap(),
+            app.handle_search_key(KeyEvent::from(KeyCode::BackTab))
+                .unwrap(),
             Action::None
         );
         assert_eq!(app.selected, 2);
 
         app.selected = 2;
         assert_eq!(
-            app.handle_search_key(KeyEvent::new(
-                KeyCode::Char('n'),
-                KeyModifiers::CONTROL
-            ))
-            .unwrap(),
+            app.handle_search_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+                .unwrap(),
             Action::None
         );
         assert_eq!(app.selected, 0);
 
         app.selected = 0;
         assert_eq!(
-            app.handle_search_key(KeyEvent::new(
-                KeyCode::Char('p'),
-                KeyModifiers::CONTROL
-            ))
-            .unwrap(),
+            app.handle_search_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                .unwrap(),
             Action::None
         );
         assert_eq!(app.selected, 2);
@@ -2771,27 +2773,25 @@ mod tests {
 
     #[test]
     fn filter_mode_navigation_wraps_with_ctrl_j_k() {
-        let mut app = App::new(vec![workspace("alpha"), workspace("beta"), workspace("gamma")]);
+        let mut app = app(vec![
+            workspace("alpha"),
+            workspace("beta"),
+            workspace("gamma"),
+        ]);
         app.begin_search(None);
 
         app.selected = 2;
         assert_eq!(
-            app.handle_search_key(KeyEvent::new(
-                KeyCode::Char('j'),
-                KeyModifiers::CONTROL
-            ))
-            .unwrap(),
+            app.handle_search_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL))
+                .unwrap(),
             Action::None
         );
         assert_eq!(app.selected, 0);
 
         app.selected = 0;
         assert_eq!(
-            app.handle_search_key(KeyEvent::new(
-                KeyCode::Char('k'),
-                KeyModifiers::CONTROL
-            ))
-            .unwrap(),
+            app.handle_search_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL))
+                .unwrap(),
             Action::None
         );
         assert_eq!(app.selected, 2);
