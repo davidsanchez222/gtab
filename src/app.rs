@@ -1133,8 +1133,13 @@ impl App {
                 Ok(Action::None)
             }
             KeyCode::Backspace => {
-                self.filter.pop();
-                self.update_filter_after_edit();
+                if self.filter.is_empty() {
+                    // Backspace on an empty buffer exits filter mode.
+                    self.commit_search();
+                } else {
+                    self.filter.pop();
+                    self.update_filter_after_edit();
+                }
                 Ok(Action::None)
             }
             KeyCode::Up => {
@@ -2975,6 +2980,23 @@ mod tests {
             Action::None
         );
         assert_eq!(app.selected, 2);
+    }
+
+    #[test]
+    fn search_backspace_on_empty_exits_filter_mode() {
+        let mut app = app(vec![workspace("alpha"), workspace("beta")]);
+        app.begin_search(None);
+
+        assert!(app.search_active());
+        assert!(app.filter.is_empty());
+
+        assert_eq!(
+            app.handle_search_key(KeyEvent::from(KeyCode::Backspace))
+                .unwrap(),
+            Action::None
+        );
+        assert!(!app.search_active());
+        assert!(app.filter.is_empty());
     }
 
     #[test]
